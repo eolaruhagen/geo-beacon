@@ -28,6 +28,37 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+# Tells the routing worker whether a searcher is standing still.
+# Idle = fewer than 2 pings in the window, or first-to-last displacement
+# below the threshold. Used to skip re-dispatch ticks for stationary users.
+def is_idle(
+    user_id: int,
+    mission_id: int,
+    now_ts: int | None = None,
+    window_s: int = 120,
+    min_distance_m: float = 10.0,
+) -> bool:
+    """True if the searcher has not moved >= min_distance_m (straight-line)
+    over the last window_s seconds, or has fewer than 2 pings in that window.
+    """
+    now = now_ts if now_ts is not None else int(time.time())
+    since = now - window_s
+    with session() as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, lat, lon
+            FROM pings
+            WHERE mission_id = ? AND user_id = ? AND ts >= ?
+            ORDER BY ts ASC
+            """,
+            (mission_id, user_id, since),
+        ).fetchall()
+    if len(rows) < 2:
+        return True
+    first, last = rows[0], rows[-1]
+    return _haversine_m(first["lat"], first["lon"], last["lat"], last["lon"]) < min_distance_m
+
+
 # Picks which mission we are talking about.
 # If nobody gives a mission id, it grabs the newest active mission.
 def _resolve_mission_id(mission_id: int | None = None) -> int:

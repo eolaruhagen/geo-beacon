@@ -20,7 +20,7 @@ import time
 from typing import Any
 
 from agent.payload import DispatchContext, build_dispatch_context
-from agent.skills.read import active_missions, list_searchers
+from agent.skills.read import active_missions, is_idle, list_searchers
 from agent.skills.write import dispatch_to_cell
 from scripts.apply_migrations import apply, DEFAULT_DB_PATH, DEFAULT_MIGRATIONS_DIR
 
@@ -308,9 +308,12 @@ def _route_one(
         )
 
 
-def _contexts_for_tick(args: argparse.Namespace) -> list[DispatchContext]:
+def _contexts_for_tick(
+    args: argparse.Namespace,
+) -> tuple[list[DispatchContext], list[RoutingResult]]:
     missions = [{"id": args.mission_id}] if args.mission_id else active_missions()
     contexts: list[DispatchContext] = []
+    skipped: list[RoutingResult] = []
     for mission in missions:
         mission_id = int(mission["id"])
         for searcher in list_searchers(mission_id):
@@ -322,22 +325,38 @@ def _contexts_for_tick(args: argparse.Namespace) -> list[DispatchContext]:
                 continue
             if args.skip_active and searcher["active_dispatch"] is not None:
                 continue
+            if args.skip_idle and is_idle(
+                int(searcher["id"]),
+                mission_id,
+                window_s=args.idle_window_s,
+                min_distance_m=args.idle_min_distance_m,
+            ):
+                skipped.append(
+                    RoutingResult(
+                        mission_id=mission_id,
+                        user_id=int(searcher["id"]),
+                        callsign=searcher.get("callsign") or str(searcher["id"]),
+                        status="skipped_idle",
+                        duration_s=0.0,
+                    )
+                )
+                continue
             contexts.append(build_dispatch_context(mission_id, int(searcher["id"])))
             if args.max_searchers and len(contexts) >= args.max_searchers:
-                return contexts
-    return contexts
+                return contexts, skipped
+    return contexts, skipped
 
 
 def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
     apply(os.environ.get("MISSION_DB_PATH", DEFAULT_DB_PATH), DEFAULT_MIGRATIONS_DIR)
-    contexts = _contexts_for_tick(args)
+    contexts, skipped = _contexts_for_tick(args)
     if args.print_payloads:
         for context in contexts:
             print(f"===== {context.callsign} =====")
             print(context.text)
             print()
     if args.payloads_only:
-        return [
+        payload_results = [
             RoutingResult(
                 mission_id=context.mission_id,
                 user_id=context.user_id,
@@ -347,8 +366,12 @@ def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
             )
             for context in contexts
         ]
+        combined = payload_results + skipped
+        combined.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
+        return combined
     if not contexts:
-        return []
+        skipped.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
+        return skipped
 
     max_workers = max(1, min(args.parallelism, len(contexts)))
     results: list[RoutingResult] = []
@@ -366,6 +389,7 @@ def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
         ]
         for future in as_completed(futures):
             results.append(future.result())
+    results.extend(skipped)
     results.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
     return results
 
@@ -390,6 +414,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=int, default=60)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--skip-active", action="store_true", help="Do not re-route users who already have an active dispatch")
+    parser.add_argument(
+        "--skip-idle",
+        dest="skip_idle",
+        action="store_true",
+        default=True,
+        help="Skip volunteers who have not moved recently (default: on)",
+    )
+    parser.add_argument(
+        "--no-skip-idle",
+        dest="skip_idle",
+        action="store_false",
+        help="Disable idle gating; route every volunteer with a latest ping",
+    )
+    parser.add_argument(
+        "--idle-window-s",
+        type=int,
+        default=int(os.environ.get("ROUTING_AGENT_IDLE_WINDOW_S", 120)),
+        help="Movement window (seconds) used by the idle predicate",
+    )
+    parser.add_argument(
+        "--idle-min-distance-m",
+        type=float,
+        default=float(os.environ.get("ROUTING_AGENT_IDLE_MIN_DISTANCE_M", 10.0)),
+        help="First-to-last displacement (meters) below which a searcher is idle",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Run model/heuristic but do not write dispatch rows")
     parser.add_argument("--payloads-only", action="store_true", help="Build payloads and exit without model calls")
     parser.add_argument("--print-payloads", action="store_true")
