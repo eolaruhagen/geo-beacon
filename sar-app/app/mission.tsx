@@ -1,5 +1,5 @@
 import { router } from 'expo-router';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapView, { Callout, Marker, Polygon, Polyline, UrlTile, type Region } from 'react-native-maps';
@@ -415,41 +415,13 @@ export default function MissionView() {
   const findingPins = useMemo(() => {
     if (findings.length === 0) return null;
     return findings.map((f, i) => {
-      const [lon, lat] = f.geometry.coordinates;
-      const color = FINDING_COLORS[f.properties.kind] ?? FINDING_COLORS.other;
-      const { kind, description, confidence, ts } = f.properties;
-      const glyph = glyphFor(kind);
-      return (
-        <Marker
-          // Server doesn't currently include finding.id in properties — fall
-          // back to ts+index. Findings can't be edited/deleted from the UI so
-          // identity stability across polls is good-enough.
-          key={`finding-${ts}-${i}`}
-          coordinate={{ latitude: lat, longitude: lon }}
-          anchor={{ x: 0.5, y: 1 }}
-          // CRITICAL: without this, every 5s state poll re-renders the
-          // Marker, and RN-maps closes any open Callout as part of the
-          // redraw. Symptom is "tap pin, preview flashes for ~500ms,
-          // disappears" — fixed by telling RN-maps to render the marker
-          // once and ignore subsequent child View changes.
-          tracksViewChanges={false}
-        >
-          <View style={[s.findingPin, { backgroundColor: color }]}>
-            <Text style={s.findingPinGlyph}>{glyph}</Text>
-          </View>
-          <Callout tooltip>
-            <FindingCalloutContent
-              kind={kind}
-              description={description}
-              confidence={confidence}
-              ts={ts}
-              color={color}
-              glyph={glyph}
-              timeLabel={formatTime(ts)}
-            />
-          </Callout>
-        </Marker>
-      );
+      const { ts } = f.properties;
+      // Identity stability: each FindingMarker is keyed by ts (+ index as a
+      // tiebreaker for vanishingly-rare same-ts inserts). React.memo on the
+      // component (see FindingMarker below) compares the finding by ts so
+      // parent re-renders — region pans, state polls, GPS pings — don't
+      // ripple down into the Marker and tear down any open Callout.
+      return <FindingMarker key={`finding-${ts}-${i}`} finding={f} />;
     });
   }, [findings]);
 
@@ -984,6 +956,69 @@ function LegendRow({ swatch, label }: { swatch: React.ReactNode; label: string }
     </View>
   );
 }
+
+/**
+ * Memoized finding marker. Wrapping the Marker in React.memo with a
+ * content-aware equality check means the Marker JSX is reconciled by React
+ * to the SAME element when nothing about the finding has changed — so the
+ * Marker doesn't re-render on the parent's every-5s state poll, region
+ * pans, or GPS ticks, and the open Callout stays open.
+ *
+ * Without this, RN-maps tears down and re-mounts the Marker (and any
+ * mounted Callout child) whenever React reconciles a fresh JSX subtree,
+ * even with tracksViewChanges={false}. Symptom: tap the pin, preview
+ * flashes for ~500ms, vanishes. Memoizing the marker removes that path.
+ */
+const FindingMarker = memo(
+  function FindingMarker({ finding }: { finding: FindingFeature }) {
+    const [lon, lat] = finding.geometry.coordinates;
+    const { kind, description, confidence, ts } = finding.properties;
+    const color = FINDING_COLORS[kind] ?? FINDING_COLORS.other;
+    const glyph = glyphFor(kind);
+    return (
+      <Marker
+        coordinate={{ latitude: lat, longitude: lon }}
+        anchor={FINDING_ANCHOR}
+        tracksViewChanges={false}
+      >
+        <View style={[s.findingPin, { backgroundColor: color }]}>
+          <Text style={s.findingPinGlyph}>{glyph}</Text>
+        </View>
+        <Callout tooltip>
+          <FindingCalloutContent
+            kind={kind}
+            description={description}
+            confidence={confidence}
+            ts={ts}
+            color={color}
+            glyph={glyph}
+            timeLabel={formatTime(ts)}
+          />
+        </Callout>
+      </Marker>
+    );
+  },
+  // Findings are append-only and identified by ts + content. Compare every
+  // property we render to avoid spurious re-mounts when state.geojson hands
+  // us a new array reference but identical contents.
+  (a, b) => {
+    const pa = a.finding.properties;
+    const pb = b.finding.properties;
+    if (pa.ts !== pb.ts) return false;
+    if (pa.kind !== pb.kind) return false;
+    if (pa.description !== pb.description) return false;
+    if (pa.confidence !== pb.confidence) return false;
+    const ca = a.finding.geometry.coordinates;
+    const cb = b.finding.geometry.coordinates;
+    return ca[0] === cb[0] && ca[1] === cb[1];
+  },
+);
+
+// Stable reference — without this, anchor={{ x: 0.5, y: 1 }} would create
+// a new object literal each parent render, defeating the React.memo above
+// (the prop comparison is shallow, sees a new object, deems the Marker
+// dirty, redraws, closes Callout).
+const FINDING_ANCHOR = { x: 0.5, y: 1 } as const;
 
 function glyphFor(kind: FindingKind): string {
   switch (kind) {
