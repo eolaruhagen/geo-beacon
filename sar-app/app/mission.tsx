@@ -32,6 +32,10 @@ export default function MissionView() {
   const [sheetOpen, setSheetOpen] = useState(false);
   // Waypoints forwarded up by MissionHud — drawn as a Polyline on the map.
   const [routeWaypoints, setRouteWaypoints] = useState<RouteWaypoint[] | null>(null);
+  // Tracked via onRegionChangeComplete — drives segment-label gating below.
+  // Starts null and is hydrated from initialRegion once the grid loads, so
+  // labels can show on first paint without waiting for the user to pan.
+  const [region, setRegion] = useState<Region | null>(null);
 
   const loadHexGrid = useCallback(async () => {
     if (!mission) return;
@@ -40,7 +44,12 @@ export default function MissionView() {
       setGrid(g);
       // Only set initialRegion the first time so a refetch doesn't yank the
       // camera back to the bbox after the user has panned around.
-      setInitialRegion((prev) => prev ?? regionFromGrid(g));
+      const r = regionFromGrid(g);
+      setInitialRegion((prev) => prev ?? r);
+      // Seed `region` from the same source so label-gating logic has something
+      // to compare against before the user first pans/zooms (onRegionChange
+      // doesn't fire on initial mount in every RN-maps version).
+      setRegion((prev) => prev ?? r);
     } catch (e) {
       console.warn('[hex_grid] fetch failed', e);
     }
@@ -351,8 +360,30 @@ export default function MissionView() {
   }, [routeWaypoints]);
 
   const segmentLabels = useMemo(() => {
-    if (segments.length === 0) return null;
-    return segments.map((seg) => {
+    if (segments.length === 0 || !region) return null;
+    // Zoom gate: when zoomed out further than ~550m vertical view, the labels
+    // tile-stack into illegible mush. Hide them entirely until the user
+    // zooms in enough that the labels can read.
+    if (region.latitudeDelta >= LABEL_ZOOM_LAT_DELTA) return null;
+
+    // Focal gate: even when zoomed in, only label segments whose centroid
+    // sits inside the user's fovea — a centered box LABEL_FOCAL_FRACTION
+    // of the viewport. Off-center hexes still render as outlines so the
+    // map structure stays intact; the names just appear where the eye is.
+    const cLat = region.latitude;
+    const cLon = region.longitude;
+    const halfLat = (region.latitudeDelta * LABEL_FOCAL_FRACTION) / 2;
+    const halfLon = (region.longitudeDelta * LABEL_FOCAL_FRACTION) / 2;
+
+    return segments
+      .filter((seg) => {
+        const c = polygonCentroid(seg.geometry.coordinates[0]);
+        return (
+          Math.abs(c.latitude - cLat) <= halfLat &&
+          Math.abs(c.longitude - cLon) <= halfLon
+        );
+      })
+      .map((seg) => {
       const c = polygonCentroid(seg.geometry.coordinates[0]);
       const strokeColor = SEGMENT_STATUS_COLOR[seg.properties.status];
       const assigneeUserId = seg.properties.assigned_user_id;
@@ -386,7 +417,7 @@ export default function MissionView() {
         </Marker>
       );
     });
-  }, [segments, callsignByUserId]);
+  }, [segments, callsignByUserId, region]);
 
   return (
     <View style={s.root}>
@@ -395,6 +426,7 @@ export default function MissionView() {
         showsUserLocation
         showsCompass={false}
         initialRegion={initialRegion ?? undefined}
+        onRegionChangeComplete={setRegion}
       >
         {polygons}
         {trailLines}
@@ -515,6 +547,18 @@ function regionFromGrid(g: HexGrid): Region | null {
     longitudeDelta: lonDelta,
   };
 }
+
+// Segment-label visibility thresholds. Tuned for the current 105m flat-to-flat
+// hex segments — ~5 hex rows visible at the zoom-in threshold below.
+// LABEL_ZOOM_LAT_DELTA: hide labels entirely when the camera shows more than
+//   this much latitude vertically (~550m for delta=0.005). Below this the
+//   labels stack into illegible mush.
+// LABEL_FOCAL_FRACTION: even when zoomed in, only label segments whose
+//   centroid sits inside this fraction of the viewport centered on the
+//   camera. 0.5 = inner 50% box, which is roughly the user's fovea on a
+//   handheld phone.
+const LABEL_ZOOM_LAT_DELTA = 0.005;
+const LABEL_FOCAL_FRACTION = 0.5;
 
 const ACCENT = '#d6362f';
 const SELF_TRACK_COLOR = '#5a6cf2';
