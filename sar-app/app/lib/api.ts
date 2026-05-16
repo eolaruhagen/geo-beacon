@@ -310,3 +310,20 @@ export function postDebugDispatch(
 ): Promise<ActiveDispatch> {
   return authedPost<ActiveDispatch>(serverUrl, bearerToken, '/debug/dispatch', body);
 }
+
+// ─── /debug/snapshot ─────────────────────────────────────────────────────
+// Demo helper: ask the server to checkpoint the live SQLite DB to /tmp so
+// the demo state can be rolled back between runs. Returns the on-disk path
+// + size of the snapshot file.
+export type SnapshotResponse = {
+  path: string;
+  bytes: number;
+  ts: number;
+};
+
+export function postSnapshot(
+  serverUrl: string,
+  bearerToken: string,
+): Promise<SnapshotResponse> {
+  return authedPost<SnapshotResponse>(serverUrl, bearerToken, '/debug/snapshot', {});
+}
