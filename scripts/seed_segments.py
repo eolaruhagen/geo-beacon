@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""Subdivide a mission area into ~100m grid segments and compute initial POA.
+"""Subdivide a mission area into ~105m flat-to-flat hex segments and compute
+initial POA.
 
 Usage:
     python scripts/seed_segments.py --mission-id N [--verbose]
 
-Reads mission from DB, subdivides bbox into ~100m segments, aggregates terrain
-stats from hex_data passed in memory, computes POA, bulk-inserts segments.
+Reads mission from DB, generates a flat-top hex grid over the mission bbox
+(odd-q offset coordinates, origin = bbox SW corner), aggregates fine-hex
+terrain stats from `hex_data` passed in memory, computes POA, bulk-inserts
+segments.
+
+Grid choices:
+  * Cell shape: flat-top hexagon, 105 m flat-to-flat (~9,545 m² each).
+  * Origin: bbox SW corner of the mission area. NOT clipped to area_geom —
+    hexes covering the bbox stay even if they stick out beyond the user-drawn
+    polygon (matches the previous square-grid behavior).
+  * Naming: row/col offset, formatted `S-r{row:02d}-c{col:02d}`, so callouts
+    over radio map directly to a grid coordinate.
+  * Fine-hex → coarse-hex assignment for POA aggregation: nearest coarse-hex
+    center (equivalent to point-in-polygon for a regular hex grid). The
+    `seed_hex_cells` step does the on-DB assignment via SpatiaLite
+    ST_Contains, which agrees with this on the interior; the two only
+    disagree for degenerate centroid-on-edge cases that don't affect stats.
 
 New signature: seed_segments(mission_id, hex_data) -> list[int]
 """
@@ -15,6 +31,7 @@ import argparse
 import logging
 import math
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +45,38 @@ log = logging.getLogger("seed_segments")
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Grid parameters
+# ---------------------------------------------------------------------------
+
+CELL_FLAT_TO_FLAT_M = 105.0
+W = CELL_FLAT_TO_FLAT_M
+R = W / math.sqrt(3)          # circumradius / side length
+COL_STEP_M = 1.5 * R          # ≈ W * sqrt(3)/2 ≈ 90.9 m
+ROW_STEP_M = W                # ≈ 105 m
+COL_Y_OFFSET_M = W / 2        # vertical shift for odd columns
+HEX_AREA_M2 = (3.0 * math.sqrt(3.0) / 2.0) * R * R
+
+
+# ---------------------------------------------------------------------------
+# Projection helpers (equirectangular, anchored at the mission centroid)
+# ---------------------------------------------------------------------------
+
+def _make_projection(lat0: float, lon0: float):
+    cos_lat0 = math.cos(math.radians(lat0))
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * cos_lat0
+
+    def to_xy(lat: float, lon: float) -> tuple[float, float]:
+        return ((lon - lon0) * m_per_deg_lon, (lat - lat0) * m_per_deg_lat)
+
+    def to_latlon(x: float, y: float) -> tuple[float, float]:
+        return (lat0 + y / m_per_deg_lat, lon0 + x / m_per_deg_lon)
+
+    return to_xy, to_latlon
+
+
+# ---------------------------------------------------------------------------
+# Geometry
 # ---------------------------------------------------------------------------
 
 def _bbox_from_geojson(geojson: dict) -> tuple[float, float, float, float]:
@@ -38,64 +86,92 @@ def _bbox_from_geojson(geojson: dict) -> tuple[float, float, float, float]:
     return min(lats), min(lons), max(lats), max(lons)
 
 
-def _deg_per_100m(lat: float) -> tuple[float, float]:
-    dlat = 100.0 / 111_320.0
-    dlon = 100.0 / (111_320.0 * math.cos(math.radians(lat)))
-    return dlat, dlon
-
-
-def _cell_polygon_geojson(lat: float, lon: float, dlat: float, dlon: float) -> dict:
-    half_lat = dlat / 2
-    half_lon = dlon / 2
-    ring = [
-        [lon - half_lon, lat - half_lat],
-        [lon + half_lon, lat - half_lat],
-        [lon + half_lon, lat + half_lat],
-        [lon - half_lon, lat + half_lat],
-        [lon - half_lon, lat - half_lat],
+def _flat_top_hex_vertices_m(cx: float, cy: float) -> list[tuple[float, float]]:
+    """CCW vertices of a flat-top hex centered at (cx, cy). Closed ring (7 points)."""
+    h = W / 2.0  # apothem
+    return [
+        (cx + R,       cy),
+        (cx + R / 2,   cy + h),
+        (cx - R / 2,   cy + h),
+        (cx - R,       cy),
+        (cx - R / 2,   cy - h),
+        (cx + R / 2,   cy - h),
+        (cx + R,       cy),  # close
     ]
-    return {"type": "Polygon", "coordinates": [ring]}
 
 
-def _approx_area_m2(dlat: float, dlon: float, lat: float) -> float:
-    h = dlat * 111_320.0
-    w = dlon * 111_320.0 * math.cos(math.radians(lat))
-    return h * w
-
-
-# ---------------------------------------------------------------------------
-# Hex data aggregation helpers
-# ---------------------------------------------------------------------------
-
-def _build_hex_index(
-    hex_data: list[dict],
-) -> list[tuple[float, float, float, float, dict]]:
-    """Return (min_lat, min_lon, max_lat, max_lon, hex) for fast bbox lookup."""
-    index = []
-    for h in hex_data:
-        coords = h["poly_geojson"]["coordinates"][0]
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
-        index.append((min(lats), min(lons), max(lats), max(lons), h))
-    return index
-
-
-def _hexes_in_bbox(
-    seg_min_lat: float, seg_min_lon: float,
-    seg_max_lat: float, seg_max_lon: float,
-    hex_index: list[tuple[float, float, float, float, dict]],
+def _generate_hex_grid(
+    min_lat: float, min_lon: float, max_lat: float, max_lon: float, to_xy, to_latlon,
 ) -> list[dict]:
-    result = []
-    for h_min_lat, h_min_lon, h_max_lat, h_max_lon, h in hex_index:
-        if h_max_lat < seg_min_lat or h_min_lat > seg_max_lat:
-            continue
-        if h_max_lon < seg_min_lon or h_min_lon > seg_max_lon:
-            continue
-        result.append(h)
-    return result
+    """Generate the coarse hex grid covering the bbox.
+
+    Returns a list of dicts (in deterministic row-major order):
+      {row, col, center_lat, center_lon, center_x, center_y, poly_geojson}
+    """
+    min_x, min_y = to_xy(min_lat, min_lon)
+    max_x, max_y = to_xy(max_lat, max_lon)
+
+    # +1 in each axis to fully cover the bbox; an off-by-one here only adds
+    # an extra rim of hexes and never drops one.
+    ncols = int(math.ceil((max_x - min_x) / COL_STEP_M)) + 1
+    nrows = int(math.ceil((max_y - min_y) / ROW_STEP_M)) + 1
+
+    cells: list[dict] = []
+    for col in range(ncols):
+        cx = min_x + col * COL_STEP_M
+        for row in range(nrows):
+            cy = min_y + row * ROW_STEP_M
+            if col % 2 == 1:
+                cy += COL_Y_OFFSET_M
+
+            verts_m = _flat_top_hex_vertices_m(cx, cy)
+            ring = []
+            for vx, vy in verts_m:
+                vlat, vlon = to_latlon(vx, vy)
+                ring.append([vlon, vlat])  # GeoJSON is [lon, lat]
+
+            center_lat, center_lon = to_latlon(cx, cy)
+            cells.append({
+                "row": row,
+                "col": col,
+                "center_x": cx,
+                "center_y": cy,
+                "center_lat": center_lat,
+                "center_lon": center_lon,
+                "poly_geojson": {"type": "Polygon", "coordinates": [ring]},
+            })
+    return cells
 
 
-def _mode(values: list[str]) -> str:
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+def _assign_fine_to_coarse(
+    fine_hexes: list[dict], coarse: list[dict], to_xy,
+) -> dict[int, list[dict]]:
+    """Group fine hexes by the index of the coarse hex whose center is nearest
+    (equivalent to point-in-polygon for a regular hex grid)."""
+    groups: dict[int, list[dict]] = defaultdict(list)
+    for fh in fine_hexes:
+        fx, fy = to_xy(fh["center_lat"], fh["center_lon"])
+        best_idx = -1
+        best_d2 = float("inf")
+        for idx, ch in enumerate(coarse):
+            dx = ch["center_x"] - fx
+            dy = ch["center_y"] - fy
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = idx
+        if best_idx >= 0:
+            groups[best_idx].append(fh)
+    return groups
+
+
+def _mode(values: list[str], default: str) -> str:
+    if not values:
+        return default
     counts: dict[str, int] = {}
     for v in values:
         counts[v] = counts.get(v, 0) + 1
@@ -107,8 +183,8 @@ def _mode(values: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def seed_segments(mission_id: int, hex_data: list[dict]) -> list[int]:
-    """Subdivide mission area into ~100m segments, aggregate hex terrain stats,
-    compute POA, bulk-insert. Returns list of inserted segment ids."""
+    """Generate hex segment grid, aggregate hex terrain stats, compute POA,
+    bulk-insert. Returns list of inserted segment ids in row-major order."""
     mission = get_mission(mission_id)
     if mission is None:
         raise ValueError(f"Mission {mission_id} not found")
@@ -121,114 +197,105 @@ def seed_segments(mission_id: int, hex_data: list[dict]) -> list[int]:
     pls_lon: float = mission["pls_lon"]
 
     min_lat, min_lon, max_lat, max_lon = _bbox_from_geojson(area_geojson)
-    mid_lat = (min_lat + max_lat) / 2
-    dlat, dlon = _deg_per_100m(mid_lat)
+    mid_lat = (min_lat + max_lat) / 2.0
+    mid_lon = (min_lon + max_lon) / 2.0
+
+    to_xy, to_latlon = _make_projection(mid_lat, mid_lon)
 
     log.info(
         "Mission %d bbox lat=[%.5f,%.5f] lon=[%.5f,%.5f]",
         mission_id, min_lat, max_lat, min_lon, max_lon,
     )
 
-    # Idempotent: remove existing segments before re-seeding.
+    # Idempotent: drop existing segments before re-seeding.
     with session() as conn:
         conn.execute("DELETE FROM segments WHERE mission_id = ?", (mission_id,))
 
-    hex_index = _build_hex_index(hex_data)
-    log.info("Loaded %d hex cells for aggregation", len(hex_data))
+    coarse = _generate_hex_grid(min_lat, min_lon, max_lat, max_lon, to_xy, to_latlon)
+    log.info("Generated %d coarse hex segments", len(coarse))
 
-    # Find PLS elevation from hex nearest to PLS
+    # PLS elevation from the nearest fine hex (planar distance is fine here).
     pls_elev_m = 100.0
     if hex_data:
-        best_dist = float("inf")
+        best_d2 = float("inf")
         for h in hex_data:
-            d = math.sqrt((h["center_lat"] - pls_lat) ** 2 + (h["center_lon"] - pls_lon) ** 2)
-            if d < best_dist:
-                best_dist = d
+            dx = h["center_lon"] - pls_lon
+            dy = h["center_lat"] - pls_lat
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
                 pls_elev_m = h.get("center_elev_m", 100.0)
 
-    # Per-segment accumulators
-    seg_centers: list[tuple[float, float]] = []
-    seg_elev_m: list[float] = []
-    seg_cover: list[str] = []
-    seg_has_trail: list[bool] = []
-    seg_slope: list[float] = []
-    seg_trail_len_m: list[float] = []
-    seg_poly_geojsons: list[dict] = []
-    seg_area_m2: list[float] = []
+    # Fine-hex → coarse-hex aggregation (nearest center == contains for
+    # regular flat-top grid).
+    groups = _assign_fine_to_coarse(hex_data, coarse, to_xy)
 
-    lat = min_lat + dlat / 2
-    while lat < max_lat:
-        lon = min_lon + dlon / 2
-        while lon < max_lon:
-            seg_min_lat = lat - dlat / 2
-            seg_max_lat = lat + dlat / 2
-            seg_min_lon = lon - dlon / 2
-            seg_max_lon = lon + dlon / 2
+    rows: list[dict] = []
+    centers: list[tuple[float, float]] = []
+    elevs: list[float] = []
+    covers: list[str] = []
+    has_trails: list[bool] = []
+    aggs: list[dict] = []  # parallel array for downstream POA + INSERT
 
-            contained = _hexes_in_bbox(
-                seg_min_lat, seg_min_lon, seg_max_lat, seg_max_lon, hex_index
-            )
+    for idx, ch in enumerate(coarse):
+        contained = groups.get(idx, [])
+        if contained:
+            avg_slope = sum(h.get("slope_deg", 0.0) for h in contained) / len(contained)
+            dominant_cover = _mode([h.get("dominant_cover", "mixed") for h in contained], "mixed")
+            avg_elev = sum(h.get("center_elev_m", 100.0) for h in contained) / len(contained)
+            trail_hex_count = sum(1 for h in contained if h.get("has_trail", False))
+            trail_length_m = trail_hex_count * 30.0
+            has_trail = trail_hex_count > 0
+        else:
+            # Coarse hex sticking out beyond the fetched terrain — give it
+            # defaults so the row still inserts and the agent can see it.
+            avg_slope = 0.0
+            dominant_cover = "mixed"
+            avg_elev = pls_elev_m
+            trail_length_m = 0.0
+            has_trail = False
 
-            if contained:
-                avg_slope = sum(h.get("slope_deg", 0.0) for h in contained) / len(contained)
-                dominant_cover = _mode([h.get("dominant_cover", "mixed") for h in contained])
-                avg_elev = sum(h.get("center_elev_m", 100.0) for h in contained) / len(contained)
-                # trail_length_m: count of hexes with has_trail * 30m cell size
-                trail_hex_count = sum(1 for h in contained if h.get("has_trail", False))
-                trail_length_m = trail_hex_count * 30.0
-                has_trail = trail_hex_count > 0
-            else:
-                avg_slope = 0.0
-                dominant_cover = "mixed"
-                avg_elev = pls_elev_m
-                trail_length_m = 0.0
-                has_trail = False
+        centers.append((ch["center_lat"], ch["center_lon"]))
+        elevs.append(avg_elev)
+        covers.append(dominant_cover)
+        has_trails.append(has_trail)
+        aggs.append({
+            "row": ch["row"],
+            "col": ch["col"],
+            "poly_geojson": ch["poly_geojson"],
+            "avg_slope_deg": avg_slope,
+            "dominant_cover": dominant_cover,
+            "trail_length_m": trail_length_m,
+        })
 
-            seg_centers.append((lat, lon))
-            seg_elev_m.append(avg_elev)
-            seg_cover.append(dominant_cover)
-            seg_has_trail.append(has_trail)
-            seg_slope.append(avg_slope)
-            seg_trail_len_m.append(trail_length_m)
-            seg_poly_geojsons.append(_cell_polygon_geojson(lat, lon, dlat, dlon))
-            seg_area_m2.append(_approx_area_m2(dlat, dlon, lat))
-
-            lon += dlon
-        lat += dlat
-
-    n_segs = len(seg_centers)
-    log.info("Grid has %d segments", n_segs)
-
-    if n_segs == 0:
+    if not aggs:
         log.warning("No segments generated — check mission area_geom")
         return []
 
     raw_weights = initial_poa_weights(
-        cell_centers=seg_centers,
-        cell_elev_m=seg_elev_m,
-        cell_cover=seg_cover,
-        cell_has_trail=seg_has_trail,
+        cell_centers=centers,
+        cell_elev_m=elevs,
+        cell_cover=covers,
+        cell_has_trail=has_trails,
         pls_lat=pls_lat,
         pls_lon=pls_lon,
         pls_elev_m=pls_elev_m,
     )
-
     total_w = sum(raw_weights) or 1.0
 
-    rows: list[dict] = []
-    for i in range(n_segs):
+    for i, ag in enumerate(aggs):
         rows.append({
-            "name": f"S-{i + 1:03d}",
-            "poly_geojson": seg_poly_geojsons[i],
-            "area_m2": round(seg_area_m2[i], 1),
+            "name": f"S-r{ag['row']:02d}-c{ag['col']:02d}",
+            "poly_geojson": ag["poly_geojson"],
+            "area_m2": round(HEX_AREA_M2, 1),
             "poa": round(raw_weights[i] / total_w, 6),
-            "avg_slope_deg": round(seg_slope[i], 2),
-            "dominant_cover": seg_cover[i],
-            "trail_length_m": round(seg_trail_len_m[i], 1),
+            "avg_slope_deg": round(ag["avg_slope_deg"], 2),
+            "dominant_cover": ag["dominant_cover"],
+            "trail_length_m": round(ag["trail_length_m"], 1),
         })
 
     segment_ids = bulk_insert_segments(mission_id, rows)
-    log.info("Inserted %d segments for mission %d", len(segment_ids), mission_id)
+    log.info("Inserted %d hex segments for mission %d", len(segment_ids), mission_id)
     return segment_ids
 
 
