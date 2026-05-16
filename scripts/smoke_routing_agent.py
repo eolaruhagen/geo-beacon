@@ -25,7 +25,7 @@ from api.db.segments import bulk_insert_segments
 from api.db.users import create_user, set_current_mission
 from scripts.apply_migrations import apply, DEFAULT_MIGRATIONS_DIR
 from scripts.fetch_terrain import _generate_mock_hex_data
-from workers.agent import run_tick
+from workers.agent import DEFAULT_LOG_PATH, run_tick
 
 
 def _area(center_lat: float, center_lon: float, half: float) -> dict:
@@ -155,6 +155,10 @@ def main() -> int:
         candidate = Path(str(db_path) + suffix)
         if candidate.exists():
             candidate.unlink()
+    log_path = DEFAULT_LOG_PATH
+    log_before = 0
+    if log_path.exists():
+        log_before = len(log_path.read_text(encoding="utf-8").splitlines())
 
     seed_info = seed(db_path)
     worker_args = argparse.Namespace(
@@ -166,13 +170,21 @@ def main() -> int:
         interval_seconds=60,
         loop=False,
         skip_active=False,
+        skip_idle=False,
+        idle_window_s=120,
+        idle_min_distance_m=10.0,
         dry_run=False,
         payloads_only=False,
         print_payloads=args.print_payloads,
+        log_path=log_path,
+        log_enabled=True,
+        log_payloads=True,
         fallback_heuristic=True,
         mode="heuristic",
     )
     results = run_tick(worker_args)
+    log_lines = worker_args.log_path.read_text(encoding="utf-8").splitlines()
+    log_lines_added = len(log_lines) - log_before
     with session() as conn:
         counts = dict(conn.execute(
             """
@@ -198,10 +210,15 @@ def main() -> int:
         "seed": seed_info,
         "results": [r.__dict__ for r in results],
         "counts": counts,
+        "log_path": str(worker_args.log_path),
+        "log_lines_added": log_lines_added,
+        "log_lines_total": len(log_lines),
         "route_status": route_resp.status_code,
         "route": route_body,
     }, indent=2))
 
+    if log_lines_added < 6:
+        raise SystemExit("expected agent and dispatch audit log lines")
     if counts["cell_dispatches"] != 3:
         raise SystemExit("expected 3 cell dispatches")
     if route_resp.status_code != 200 or len(route_body.get("waypoints", [])) < 2:
