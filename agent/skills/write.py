@@ -1,10 +1,8 @@
 """Write/action agent skills for geo-beacon.
 
 Surviving subset after the commander-grade tools were deprecated alongside
-the §10 Mission Brief loop (see docs/2026-05-16-dispatch-agent.md and
-docs/routing-agent-implementation.md). Routing agent will land a
-`dispatch_to_cell` sibling here; until then, `dispatch_searcher` is the
-only public write skill.
+the old Mission Brief loop. The routing agent dispatches to individual
+hex cells; segment dispatch remains for debug and fallback workflows.
 """
 from __future__ import annotations
 
@@ -63,6 +61,25 @@ def _require_segment(conn, mission_id: int, segment_id: int) -> dict[str, Any]:
     ).fetchone()
     if row is None:
         raise ValueError(f"Segment {segment_id} not found in mission {mission_id}")
+    return dict(row)
+
+
+# Checks that a target hex exists in this mission.
+# It returns the hex's center point, which is what phones render as the target.
+def _require_hex_cell(conn, mission_id: int, hex_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT id, mission_id, segment_id,
+               X(Centroid(geom)) AS center_lon,
+               Y(Centroid(geom)) AS center_lat,
+               flag_impassable, is_water, is_building
+        FROM hex_cells
+        WHERE id = ? AND mission_id = ?
+        """,
+        (hex_id, mission_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Hex cell {hex_id} not found in mission {mission_id}")
     return dict(row)
 
 
@@ -234,4 +251,79 @@ def dispatch_searcher(
         "segment_id": segment_id,
         "segment_name": segment["name"],
         "status": "pending",
+    }
+
+
+# Sends a searcher to one map cell picked by the routing agent.
+# It stores a point target, not a whole segment, so the app can render a pin.
+def dispatch_to_cell(
+    user_id: int,
+    target_hex_id: int,
+    reasoning: str,
+    instruction: str | None = None,
+    mission_id: int | None = None,
+) -> dict[str, Any]:
+    """Create a cell-grain dispatch for one searcher.
+
+    The routing agent reasons in local 10x10 ASCII-map coordinates. The worker
+    translates those local coordinates to a `target_hex_id` and calls this
+    function. Existing active dispatches for the same user are superseded so a
+    phone only ever has one current target.
+    """
+    _require_reason(reasoning)
+    mid = _resolve_mission_id(mission_id)
+    with session() as conn:
+        conn.execute("BEGIN")
+        try:
+            user = _require_user(conn, mid, user_id)
+            target = _require_hex_cell(conn, mid, target_hex_id)
+            existing = _active_dispatches(conn, mid, user_id)
+            _clear_segment_assignments(conn, mid, user_id)
+
+            target_lat = float(target["center_lat"])
+            target_lon = float(target["center_lon"])
+            final_instruction = instruction or f"Move to target cell {target_hex_id}."
+            dispatch_id = _insert_dispatch(
+                conn,
+                mid,
+                user_id,
+                None,
+                None,
+                target_lat,
+                target_lon,
+                final_instruction,
+                reasoning,
+            )
+            superseded_count = _supersede_dispatches(conn, existing, dispatch_id)
+            conn.execute(
+                "UPDATE users SET status = 'dispatched' WHERE id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO broadcasts (mission_id, scope, kind, message, ts)
+                VALUES (?, ?, 'route_correction', ?, ?)
+                """,
+                (
+                    mid,
+                    db_broadcasts.user_scope(user_id),
+                    f"New target: {final_instruction}",
+                    int(time.time()),
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return {
+        "mission_id": mid,
+        "dispatch_id": dispatch_id,
+        "user_id": user_id,
+        "callsign": user["callsign"],
+        "target_hex_id": target_hex_id,
+        "entry_lat": target_lat,
+        "entry_lon": target_lon,
+        "status": "pending",
+        "superseded_count": superseded_count,
     }

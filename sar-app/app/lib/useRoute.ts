@@ -7,6 +7,7 @@
  *   - the user explicitly taps a "show route" / "refresh" button.
  *
  * Cleared when `segmentId === null` is passed (e.g. dispatch completed).
+ * Pass `undefined` to route to the current active dispatch entry point.
  */
 import { useCallback, useState } from 'react';
 
@@ -16,8 +17,8 @@ export type UseRouteResult = {
   data: RouteResponse | null;
   loading: boolean;
   error: Error | null;
-  /** Fetch the route for `segmentId`. Pass `null` to clear. */
-  fetch: (segmentId: number | null) => Promise<void>;
+  /** Fetch the route for `segmentId`. Pass `undefined` for active target, `null` to clear. */
+  fetch: (segmentId: number | null | undefined) => Promise<void>;
 };
 
 export function useRoute(
@@ -29,7 +30,7 @@ export function useRoute(
   const [error, setError] = useState<Error | null>(null);
 
   const fetch = useCallback(
-    async (segmentId: number | null) => {
+    async (segmentId: number | null | undefined) => {
       if (segmentId === null) {
         setData(null);
         setError(null);

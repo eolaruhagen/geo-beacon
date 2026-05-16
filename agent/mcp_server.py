@@ -29,6 +29,7 @@ def _register_tools(mcp) -> None:
 
     # Write tools.
     mcp.tool()(write.dispatch_searcher)
+    mcp.tool()(write.dispatch_to_cell)
 
 
 def _env_int(name: str, default: int) -> int:

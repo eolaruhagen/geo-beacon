@@ -74,13 +74,13 @@ export default function MissionView() {
     const ad = me?.active_dispatch ?? null;
     const wantsRoute =
       ad != null &&
-      ad.segment_id != null &&
+      (ad.segment_id != null || (ad.entry_lat != null && ad.entry_lon != null)) &&
       (ad.status === 'acked' || ad.status === 'in_progress');
-    const key = wantsRoute ? `${ad!.id}:${ad!.status}` : null;
+    const key = wantsRoute ? `${ad!.id}:${ad!.status}:${ad!.entry_lat}:${ad!.entry_lon}` : null;
     if (key === lastRouteKeyRef.current) return;
     lastRouteKeyRef.current = key;
     if (wantsRoute) {
-      void fetchRoute(ad!.segment_id!);
+      void fetchRoute(ad!.segment_id ?? undefined);
     } else {
       void fetchRoute(null);
     }
@@ -519,6 +519,22 @@ export default function MissionView() {
     );
   }, [routeWaypoints]);
 
+  const dispatchTargetMarker = useMemo(() => {
+    const ad = me?.active_dispatch;
+    if (!ad || ad.entry_lat == null || ad.entry_lon == null) return null;
+    return (
+      <Marker
+        key={`dispatch-target-${ad.id}`}
+        coordinate={{ latitude: ad.entry_lat, longitude: ad.entry_lon }}
+        anchor={{ x: 0.5, y: 0.5 }}
+      >
+        <View style={s.dispatchTargetOuter}>
+          <View style={s.dispatchTargetInner} />
+        </View>
+      </Marker>
+    );
+  }, [me?.active_dispatch]);
+
   const segmentLabels = useMemo(() => {
     if (segments.length === 0 || !region) return null;
     // Zoom gate: when zoomed out further than ~550m vertical view, the labels
@@ -603,6 +619,7 @@ export default function MissionView() {
         {segmentLabels}
         {trackLines}
         {routePolyline}
+        {dispatchTargetMarker}
         {searcherMarkers}
         {findingPins}
       </MapView>
@@ -1118,6 +1135,27 @@ const s = StyleSheet.create({
     fontSize: 10,
     fontWeight: '600',
     fontVariant: ['tabular-nums'],
+  },
+
+  dispatchTargetOuter: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#fff',
+    backgroundColor: 'rgba(17,24,39,0.88)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  dispatchTargetInner: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#ffd166',
   },
 
   // .mapctrl from wireframes-v2.css:254 — top-right floating control stack.

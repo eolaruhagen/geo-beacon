@@ -3,6 +3,7 @@
  *
  * On-demand hook — no polling, no AppState gating. We verify:
  *  - fetch(id) hits the right URL and stores the response
+ *  - fetch(undefined) routes to the active dispatch target
  *  - fetch(null) clears the data
  *  - errors are surfaced
  *  - calls without serverUrl/token are no-ops
@@ -56,6 +57,24 @@ describe('useRoute', () => {
     expect(fn.mock.calls[0][0]).toContain('/field/me/route?segment_id=42');
     expect(result.current.data).toEqual(route);
     expect(result.current.error).toBeNull();
+  });
+
+  it('fetches the active dispatch route when fetch(undefined) is called', async () => {
+    const route: RouteResponse = {
+      waypoints: [{ lat: 37.91, lon: -122.58 }, { lat: 37.92, lon: -122.59 }],
+      snapped: false,
+    };
+    const fn = mockFetchOnce(route);
+
+    const { result } = renderHook(() => useRoute(URL, TOKEN));
+    await act(async () => {
+      await result.current.fetch(undefined);
+    });
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn.mock.calls[0][0]).toContain('/field/me/route');
+    expect(fn.mock.calls[0][0]).not.toContain('segment_id=');
+    expect(result.current.data).toEqual(route);
   });
 
   it('clears state when fetch(null) is called', async () => {

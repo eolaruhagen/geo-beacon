@@ -58,7 +58,7 @@ import sys
 
 prompt = sys.stdin.read()
 session_id = os.environ.get("GB_OPENCLAW_SESSION_ID", "geo-beacon-realtime")
-thinking = os.environ.get("GB_OPENCLAW_THINKING", "low")
+thinking = os.environ.get("GB_OPENCLAW_THINKING", "off")
 timeout = os.environ.get("GB_OPENCLAW_TIMEOUT", "900")
 
 env = os.environ.copy()
@@ -1044,7 +1044,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", default="")
     parser.add_argument("--run-openclaw", action="store_true", default=True)
     parser.add_argument("--no-openclaw", dest="run_openclaw", action="store_false")
-    parser.add_argument("--thinking", default="low", choices=["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"])
+    parser.add_argument("--thinking", default="off", choices=["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"])
     parser.add_argument("--openclaw-timeout-seconds", type=int, default=900)
     parser.add_argument("--session-prefix", default="realtime-sar")
     parser.add_argument("--prompt", type=Path, default=REPO_ROOT / "openclaw" / "agent_prompt.md")

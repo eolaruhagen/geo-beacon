@@ -271,10 +271,11 @@ export function completeDispatch(
 export function getRoute(
   serverUrl: string,
   bearerToken: string,
-  segmentId: number,
+  segmentId?: number,
 ): Promise<RouteResponse> {
+  const path = segmentId == null ? '/field/me/route' : `/field/me/route?segment_id=${segmentId}`;
   return authedGet<RouteResponse>(
-    serverUrl, bearerToken, `/field/me/route?segment_id=${segmentId}`,
+    serverUrl, bearerToken, path,
   );
 }
 

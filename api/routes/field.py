@@ -247,33 +247,24 @@ async def dispatch_complete(
 
 @router.get("/me/route", response_model=RouteResponse)
 async def field_me_route(
-    segment_id: int = Query(..., description="Target segment id (must be in the user's active mission)"),
+    segment_id: int | None = Query(
+        None,
+        description=(
+            "Optional target segment id. Omit for the user's active dispatch "
+            "entry point, including cell-grain dispatches."
+        ),
+    ),
     user: dict = Depends(current_user),
 ) -> RouteResponse:
-    """Snap-to-trail route from the user's last known position to the target
-    segment's entry point. Spec §13: snap only, no along-trail graph routing.
+    """Snap-to-trail route from the user's last known position to the target.
 
     Resolution order for the start point: most recent ping → mission PLS.
-    Resolution order for the target point: active dispatch entry_lat/lon
-    if it matches this segment → segment centroid.
+    Resolution order for the target point: active dispatch entry_lat/lon,
+    otherwise the provided segment centroid.
     """
     mission_id = db_missions.active_mission_id_for_user(user["id"])
     if mission_id is None:
         raise HTTPException(status_code=409, detail="No active mission for this user")
-
-    with session() as conn:
-        seg = conn.execute(
-            """
-            SELECT id, X(Centroid(geom)) AS clon, Y(Centroid(geom)) AS clat
-            FROM segments WHERE id = ? AND mission_id = ?
-            """,
-            (segment_id, mission_id),
-        ).fetchone()
-    if seg is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Segment {segment_id} not found in this mission",
-        )
 
     # Start: latest ping → PLS fallback.
     latest = db_pings.latest_ping_for_user(user["id"], mission_id)
@@ -284,17 +275,40 @@ async def field_me_route(
         # mission can't be None here — active_mission_id_for_user just returned it.
         start_lat, start_lon = float(mission["pls_lat"]), float(mission["pls_lon"])
 
-    # Target: prefer the active dispatch's entry point when it's for this
-    # segment, otherwise the segment centroid.
-    target_lat = float(seg["clat"])
-    target_lon = float(seg["clon"])
     active = db_dispatches.active_dispatch_for_user(user["id"])
-    if (active is not None
-            and active.get("segment_id") == segment_id
-            and active.get("entry_lat") is not None
-            and active.get("entry_lon") is not None):
+
+    seg = None
+    if segment_id is not None:
+        with session() as conn:
+            seg = conn.execute(
+                """
+                SELECT id, X(Centroid(geom)) AS clon, Y(Centroid(geom)) AS clat
+                FROM segments WHERE id = ? AND mission_id = ?
+                """,
+                (segment_id, mission_id),
+            ).fetchone()
+        if seg is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Segment {segment_id} not found in this mission",
+            )
+
+    # Target: prefer the active dispatch's entry point when it matches the
+    # requested segment, or when no segment was requested. That covers routing
+    # dispatches whose `segment_id` is NULL and whose target is just a point.
+    if (
+        active is not None
+        and active.get("entry_lat") is not None
+        and active.get("entry_lon") is not None
+        and (segment_id is None or active.get("segment_id") == segment_id)
+    ):
         target_lat = float(active["entry_lat"])
         target_lon = float(active["entry_lon"])
+    elif seg is not None:
+        target_lat = float(seg["clat"])
+        target_lon = float(seg["clon"])
+    else:
+        raise HTTPException(status_code=409, detail="No active dispatch target to route to")
 
     snap_start = snap_point_to_nearest_trail(mission_id, start_lat, start_lon)
     snap_target = snap_point_to_nearest_trail(mission_id, target_lat, target_lon)

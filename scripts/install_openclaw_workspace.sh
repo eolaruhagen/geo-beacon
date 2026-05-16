@@ -31,4 +31,7 @@ Start the host MCP server separately:
 
 Configured OpenClaw MCP URL:
   $mcp_url
+
+Routing worker OpenClaw command:
+  OPENCLAW_ROUTER_COMMAND=$repo_root/scripts/run_openclaw_router.sh
 EOF
