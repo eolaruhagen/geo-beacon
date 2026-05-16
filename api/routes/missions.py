@@ -101,6 +101,21 @@ async def create_mission(body: CreateMissionRequest) -> CreateMissionResponse:
         except Exception as e:
             logger.warning("apply_hazard_penalty failed (mission_id=%s): %s", mission_id, e)
 
+    # BUG-4: don't activate a mission that didn't seed properly. Without
+    # segments + hex grid the field endpoints (/findings, state.geojson) will
+    # 422 forever on hex resolution. Better to fail loud at create time so the
+    # operator picks a different area / retries, instead of handing back a
+    # bearer token for an unusable mission.
+    if n_segments == 0 or n_hex == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Mission init failed: segments={n_segments}, hex_cells={n_hex}. "
+                "Likely cause: fetch_terrain or seeding step errored — check server logs. "
+                "Mission row left in 'planning' status; safe to retry with a new area."
+            ),
+        )
+
     db_missions.set_status(mission_id, "active")
 
     return CreateMissionResponse(
