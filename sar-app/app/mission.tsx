@@ -5,6 +5,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import MapView, { Marker, Polygon, Polyline, type Region } from 'react-native-maps';
 
 import FindingSheet from './components/FindingSheet';
+import MissionHud from './components/MissionHud';
+import type { RouteWaypoint } from './lib/api';
 import { startTracking, stopTracking } from './lib/location';
 import {
   fetchHexGrid,
@@ -28,6 +30,8 @@ export default function MissionView() {
   const [grid, setGrid] = useState<HexGrid | null>(null);
   const [initialRegion, setInitialRegion] = useState<Region | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
+  // Waypoints forwarded up by MissionHud — drawn as a Polyline on the map.
+  const [routeWaypoints, setRouteWaypoints] = useState<RouteWaypoint[] | null>(null);
 
   const loadHexGrid = useCallback(async () => {
     if (!mission) return;
@@ -331,6 +335,21 @@ export default function MissionView() {
     ));
   }, [segments]);
 
+  // Snap-to-trail route from the searcher's last ping to the active
+  // dispatch's segment entry, fetched on-demand by MissionHud and forwarded
+  // up via onRouteChange. Rendered as a dashed polyline.
+  const routePolyline = useMemo(() => {
+    if (!routeWaypoints || routeWaypoints.length < 2) return null;
+    return (
+      <Polyline
+        coordinates={routeWaypoints.map((w) => ({ latitude: w.lat, longitude: w.lon }))}
+        strokeColor="rgba(0,0,0,0.7)"
+        strokeWidth={3}
+        lineDashPattern={[10, 6]}
+      />
+    );
+  }, [routeWaypoints]);
+
   const segmentLabels = useMemo(() => {
     if (segments.length === 0) return null;
     return segments.map((seg) => {
@@ -383,9 +402,16 @@ export default function MissionView() {
         {segmentOutlines}
         {segmentLabels}
         {trackLines}
+        {routePolyline}
         {searcherMarkers}
         {findingPins}
       </MapView>
+
+      <MissionHud
+        serverUrl={mission?.server_url ?? null}
+        bearerToken={mission?.bearer_token ?? null}
+        onRouteChange={setRouteWaypoints}
+      />
 
       <SafeAreaView style={s.topInset} pointerEvents="box-none">
         <View style={s.topInsetRow}>

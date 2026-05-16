@@ -517,6 +517,25 @@ actual owner). Unknown id returns **404**.
 - `POST /admin/mission/{id}/finish` — sets status='ended'. Uses
   `admin_for_mission` dependency.
 
+### `api/routes/debug.py` (dev-only, strip before non-demo deploy)
+
+```
+POST /debug/dispatch
+  headers: x-bearer-token
+  body: { segment_id, sweep_type?, instruction?, reasoning?, target_user_id? }
+  effect:
+    - insert dispatch (status='pending', entry_lat/lon = segment centroid)
+    - target user.status = 'dispatched'
+    - segments.assigned_user_id = target, status = 'assigned', sweep_type set
+  returns: ActiveDispatch  (same shape as /field/me.active_dispatch)
+  errors: 404 segment, 400 target not in mission, 409 caller has no mission
+```
+
+Mimics the eventual `dispatch_searcher` agent skill closely enough that UI
+code written against this stays valid when the real agent lands. The
+default `target_user_id` is the caller — so "dispatch myself" is a
+zero-argument call in practice.
+
 ---
 
 ## Out of scope for THIS refactor
