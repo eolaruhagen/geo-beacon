@@ -28,7 +28,7 @@ Mission Control **is** the AI. No human dispatcher in the loop. A commander web 
 - App for each searcher: status, assignment, map, findings logging, SOS
 - FastAPI on the DGX as the orchestration layer
 - SQLite + SpatiaLite for state, persisted at `/home/asus/sqlite/mission.db`
-- openclaw invoked by a polling agent worker (no queue), emits structured tool calls that write to DB
+- openclaw (nemoclaw) invoked on a cron schedule, emits structured tool calls that write to DB; agent reasoning history lives in nemoclaw's memory files, not in the DB
 - Replay/sim worker for demo determinism (plus hybrid mode with real teammates)
 - Read-only commander web dashboard (Leaflet + polling)
 - Static hazard rasterization at mission init time
@@ -82,25 +82,24 @@ Mission Control **is** the AI. No human dispatcher in the loop. A commander web 
 ┌────────────────────────────────────────────────────────────────────┐
 │  SQLite + SpatiaLite at /home/asus/sqlite/mission.db (WAL mode)    │
 │  Tables: users, missions, segments, pings, dispatches, findings,   │
-│  hazards, broadcasts, hex_cells, hex_visits, osm_features,         │
-│  agent_journal                                                     │
+│  hazards, broadcasts, hex_cells, hex_visits, osm_features          │
 └───────────────────────────┬────────────────────────────────────────┘
                             │
    ┌────────────────────────┴─────────────────────────────────┐
-   │  Worker processes (tmux, sleep-loop pattern):            │
+   │  Worker processes:                                       │
    │                                                          │
-   │  • spatial_worker  (every 15s)                           │
+   │  • spatial_worker  (tmux, sleep loop, every 15s)         │
    │      new pings → point-in-hex → INSERT INTO hex_visits   │
    │      → recompute segments.pod from visited hex counts    │
    │      → mark swept, detect divergence, regenerate brief   │
    │                                                          │
-   │  • agent_worker    (polls every ~15s, no queue)          │
-   │      diff events since missions.last_agent_invocation_ts │
-   │      → if events OR force_agent_invoke=1 OR >60s idle:   │
-   │        load Mission Brief → call openclaw →              │
-   │        execute tool calls → write journal entry          │
+   │  • agent (workers/agent.py, cron-scheduled, every 60s)   │
+   │      one-shot: for each active mission, compose brief    │
+   │      from recent events → call nemoclaw → execute tool   │
+   │      calls → exit. No daemon, no watermark, no queue.    │
+   │      Reasoning history lives in nemoclaw's memory files. │
    │                                                          │
-   │  • replay_worker   (sim mode only)                       │
+   │  • replay_worker   (sim mode only, tmux sleep loop)      │
    │      reads recordings/*.jsonl → injects events on        │
    │      schedule via /field endpoints                       │
    └──────────────────────────────────────────────────────────┘
@@ -159,8 +158,6 @@ join_code                TEXT UNIQUE NOT NULL   -- short shareable string (6-cha
 created_by_user_id       INTEGER NOT NULL REFERENCES users(id)  -- = "admin"
 started_ts               INTEGER NOT NULL
 ended_ts                 INTEGER
-last_agent_invocation_ts INTEGER NOT NULL DEFAULT 0  -- agent_worker watermark
-force_agent_invoke       INTEGER NOT NULL DEFAULT 0  -- 1 = next tick must invoke
 ```
 
 ### `segments`
@@ -287,21 +284,9 @@ ts            INTEGER NOT NULL
 INDEX (mission_id, ts DESC)
 ```
 
-### `agent_journal`
+### Agent reasoning history
 
-One row per agent invocation, for transparency. `trigger` is a comma-separated list of event kinds since the last invocation watermark (since there's no queue, an invocation can react to multiple events at once).
-
-```
-id              INTEGER PRIMARY KEY
-mission_id      INTEGER NOT NULL REFERENCES missions(id)
-ts              INTEGER NOT NULL
-trigger         TEXT NOT NULL
-brief_md        TEXT NOT NULL          -- snapshot of Mission Brief input
-tool_calls_json TEXT NOT NULL          -- array of {tool, args, result}
-reasoning       TEXT                   -- agent's narration if returned
-duration_ms     INTEGER NOT NULL
-INDEX (mission_id, ts DESC)
-```
+**Not in the DB.** nemoclaw maintains its own memory files on disk; that's the source of truth for "what did the agent think, when, and why." The dashboard surfacing of agent narration (§13) reads from those files, not from a table. We can revisit promoting it back to a DB table if memory-file tailing proves awkward for the demo audience.
 
 ### `hex_cells`
 
@@ -369,7 +354,8 @@ INDEX (mission_id, kind)
 ### What's NOT in the schema (and why)
 
 - **No `teams` / `team_members`.** Dispatches target individual users via `dispatches.user_id` and `segments.assigned_user_id`. Searchers self-organize in the field.
-- **No `agent_invocation_queue`.** The agent worker polls on a tick and diffs events against `missions.last_agent_invocation_ts`. High-priority triggers set `missions.force_agent_invoke = 1` to short-circuit the next sleep.
+- **No `agent_invocation_queue`, no polling watermark.** The agent runs as a cron-scheduled one-shot script (~every 60s); each run reads recent events and composes a brief inline.
+- **No `agent_journal`.** Reasoning history lives in nemoclaw's memory files on disk.
 - **No `coverage_cache`.** POD is computed inline from `hex_visits` and written to `segments.pod` directly; no separate materialized cache needed.
 - **No `terrain_cells`.** Folded into `hex_cells` at higher resolution.
 - **No admin role.** Mission creator = admin via `missions.created_by_user_id`. Admin endpoints check `current_user.id == mission.created_by_user_id`.
@@ -448,51 +434,50 @@ When a finding is logged at `(f_lat, f_lon)` with confidence `c`:
 3. Subtract proportionally from all segments currently marked `swept`.
 4. Renormalize so Σ POA = 1.
 
-Always logged in `agent_journal` via the `update_segment_poa` skill.
+Applied by the `update_segment_poa` skill; reasoning persists in nemoclaw's memory files.
 
-## 8. Agent invocation (polling, no queue)
+## 8. Agent invocation (cron-driven)
 
-Lives in `workers/agent.py`. Each tick (~15s):
+`workers/agent.py` is a **one-shot script** scheduled via cron / systemd timer to run on a fixed interval (~every 60s). No daemon, no sleep loop, no DB watermark.
 
 ```python
-while True:
-    sleep(15)
+# pseudocode for workers/agent.py
+def main():
     for mission in active_missions():
-        events_since = SELECT events from pings/findings/dispatches/broadcasts
-                       WHERE ts > mission.last_agent_invocation_ts
-
-        should_invoke = (
-            mission.force_agent_invoke
-            or any(events_since matches a trigger row in the table below)
-            or (now() - mission.last_agent_invocation_ts) > 60
-        )
-
-        if should_invoke:
-            invoke(mission, trigger=summarize(events_since))
-            UPDATE missions SET last_agent_invocation_ts = now(),
-                                force_agent_invoke = 0
-                            WHERE id = mission.id
+        brief = compose_brief(mission)        # reads recent events from DB
+        events = recent_events(mission, since=now() - 90s)
+        if not events and not heartbeat_due(mission):
+            continue                          # nothing to react to
+        invoke_nemoclaw(brief, write_skills)  # nemoclaw uses its own memory files
 ```
 
-Trigger table — events of these kinds in `events_since` cause an invocation. (Same semantics as the original queue gate, just diff-derived instead of enqueued.)
+Cron entry on DGX:
+
+```
+* * * * * cd /home/asus/geo-beacon && .venv/bin/python -m workers.agent
+```
+
+Recent-event detection works against straightforward timestamp queries on `pings`, `findings`, `dispatches`, and `broadcasts` — no watermark column needed because the cadence is fixed and small.
+
+Trigger semantics (informational — these are kinds of recent events that compel nemoclaw to act; not gated routing):
 
 | # | Trigger              | Detected by                                                     |
 | - | -------------------- | --------------------------------------------------------------- |
-| 1 | `mission_start`      | mission row inserted, status → 'active' (force_agent_invoke=1)  |
-| 2 | `subject_found`      | finding with `kind='subject_found'` (sets force_agent_invoke=1) |
-| 3 | `finding_logged`     | any other finding except `kind='other'` w/ `confidence < 0.3`   |
-| 4 | `segment_swept`      | spatial worker marks a segment swept                            |
+| 1 | `mission_start`      | mission row inserted in the last tick window                    |
+| 2 | `subject_found`      | recent finding with `kind='subject_found'`                      |
+| 3 | `finding_logged`     | any other recent finding except `kind='other'` w/ `confidence < 0.3` |
+| 4 | `segment_swept`      | segment marked swept in the last tick window                    |
 | 5 | `divergence`         | searcher has ≥ 5 consecutive pings ≥ 100 m outside assigned segment |
-| 6 | `no_comms`           | searcher's most recent ping > 10 min old (one-shot per outage)  |
-| 7 | `dispatch_complete`  | dispatch marked `completed` by a searcher                       |
-| 8 | `heartbeat`          | > 60s since last invocation, anything else happening            |
-| 9 | `commander_override` | manual `POST /admin/agent/invoke` (sets force_agent_invoke=1)   |
+| 6 | `no_comms`           | searcher's most recent ping > 10 min old                        |
+| 7 | `dispatch_complete`  | dispatch marked `completed` in the last tick window             |
+| 8 | `heartbeat`          | nothing new but periodic check-in                               |
+| 9 | `commander_override` | manual `POST /admin/agent/invoke` (synchronous inline invocation) |
 
-Coalescing is implicit: a single tick reacts to all events since the last invocation in one openclaw call. No race between multiple workers pulling the same queue row.
+For `subject_found` and `commander_override` where 60s latency is too long: `POST /admin/agent/invoke` runs the agent inline synchronously in the API handler (same code path as the cron invocation, just called from FastAPI instead of from cron).
 
 ## 9. Agent skills (tool interface)
 
-The agent never gets raw SQL and never sees hexes. Skills are Python functions in `agent/skills/{read,write}.py`, exposed as openclaw tools with typed signatures. Every write skill writes an `agent_journal` entry; `reasoning` is a required arg on every write.
+The agent never gets raw SQL and never sees hexes. Skills are Python functions in `agent/skills/{read,write}.py`, exposed as openclaw tools with typed signatures. `reasoning` is a required arg on every write — nemoclaw's memory files retain the narration for transparency.
 
 ### Read skills
 
@@ -522,7 +507,7 @@ The agent never gets raw SQL and never sees hexes. Skills are Python functions i
 
 ## 10. Mission Brief (input to agent)
 
-Deterministic markdown, ~600 token target, regenerated by spatial_worker after each tick.
+Deterministic markdown, ~600 token target, composed by `workers/agent.py` at invocation time from current DB state.
 
 ```markdown
 # Mission Brief — {mission.name} — {now_local}
@@ -588,7 +573,7 @@ All endpoints except `/missions` and `/missions/join` require `X-Bearer-Token: <
 | POST   | `/field/dispatch/{id}/start`      | → 200. dispatch.status → `in_progress`; user.status → `on_segment`.                                                            |
 | POST   | `/field/dispatch/{id}/complete`   | `{notes?}` → 200. dispatch.status → `completed`. Counts as `dispatch_complete` event.                                          |
 | POST   | `/field/findings`                 | `{lat, lon, kind, description, confidence}` OR `{hex_id, kind, description, confidence}` → 201. Server resolves the other; sets containing hex's `flag_clue`. Fires `finding_logged` (or `subject_found`). |
-| POST   | `/field/sos`                      | `{message?}` → 201. Inserts critical hazard + all-hands broadcast. Sets `force_agent_invoke=1`.                                |
+| POST   | `/field/sos`                      | `{message?}` → 201. Inserts critical hazard + all-hands broadcast. Invokes the agent inline (same path as `/admin/agent/invoke`). |
 | GET    | `/field/me`                       | → `{user, active_dispatch, segment_geojson, nearby_hazards, recent_broadcasts}`. Polled every 5 s.                             |
 | GET    | `/field/me/route?segment_id=X`    | → list of `[lat, lon]` waypoints from current position to entry_point via snap-to-trail.                                       |
 | GET    | `/field/announcements?since={ts}` | → broadcasts visible to this user since ts.                                                                                    |
@@ -599,14 +584,14 @@ All endpoints except `/missions` and `/missions/join` require `X-Bearer-Token: <
 | ------ | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET    | `/mission/state.geojson`          | FeatureCollection: segments (color by POA/POD/status), hex_cells (only those with non-default flags, for color overlay), searchers (markers + recent tracks), findings, hazards, osm_features. Polled 10 s (app) / 3 s (dashboard). |
 | GET    | `/mission/timeline?since={ts}`    | Chronological event feed: dispatches, findings, broadcasts, agent invocations, status changes.                                                  |
-| GET    | `/mission/agent_journal?limit=20` | Recent agent reasoning entries.                                                                                                                 |
+| GET    | `/mission/agent_memory?limit=20`  | Recent nemoclaw memory entries (read from disk; deferred — endpoint stubbed until memory-file format is settled). |
 | GET    | `/mission/dashboard`              | Static HTML page (Leaflet).                                                                                                                     |
 
 ### Admin (mission creator only — checked against `missions.created_by_user_id`)
 
 | Method | Path                         | Body / Effect                                                                                                                                                                    |
 | ------ | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/admin/agent/invoke`        | `{reason?}` → sets `missions.force_agent_invoke = 1`.                                                                                                                            |
+| POST   | `/admin/agent/invoke`        | `{reason?}` → invokes the agent inline (synchronous, bypasses cron cadence). Same code path as the cron-fired invocation.                                                       |
 | POST   | `/admin/mission/{id}/finish` | recalls all searchers, marks ended.                                                                                                                                              |
 
 ### Internal
@@ -663,8 +648,8 @@ Layout:
 
 - Main map fills viewport. Layer toggles in top-right: terrain shading, landcover, segments (with POA opacity), hex coverage, searchers + tracks, hazards, findings.
 - Right rail (collapsible):
-  - **Live agent journal** — latest reasoning at top, each entry shows trigger + tool calls + reasoning text
-  - **Timeline** — same data as `/mission/timeline`, formatted
+  - **Agent activity** — deferred for the initial cut; will surface nemoclaw memory once that format is settled
+  - **Timeline** — same data as `/mission/timeline`, formatted (covers dispatches, findings, broadcasts, status changes)
   - **Searcher status list** — callsign, current segment, current POD vs target
 - Top bar: mission status, cumulative POS counter, elapsed time, big "Force agent invoke" + "End mission" buttons (POST to admin endpoints — require admin bearer).
 
@@ -698,8 +683,7 @@ geo-beacon/
 ├── migrations/
 │   ├── 001_init.sql                     # users, missions, dispatches, broadcasts
 │   ├── 002_spatial.sql                  # spatial init, missions.area_geom, pings, segments, findings, hazards
-│   ├── 003_terrain.sql                  # hex_cells, hex_visits, osm_features
-│   └── 004_agent.sql                    # agent_journal
+│   └── 003_terrain.sql                  # hex_cells, hex_visits, osm_features
 ├── api/
 │   ├── main.py                          # FastAPI app + middleware
 │   ├── db.py                            # SQLite + SpatiaLite connection helper
@@ -711,9 +695,9 @@ geo-beacon/
 │       ├── mission.py                   # /mission/*
 │       └── admin.py                     # /admin/*
 ├── workers/
-│   ├── spatial.py                       # hex_visits / POD / divergence / brief regen
-│   ├── agent.py                         # openclaw polling loop + tool exec
-│   └── replay.py                        # demo sim
+│   ├── spatial.py                       # tmux sleep loop: hex_visits / POD / divergence
+│   ├── agent.py                         # cron one-shot: brief → nemoclaw → tool exec
+│   └── replay.py                        # demo sim (tmux sleep loop)
 ├── agent/
 │   ├── brief.py                         # Mission Brief generator
 │   └── skills/
@@ -754,7 +738,7 @@ Parallelizable across teammates. Names below are role labels, not people.
 
 **Phase 1 — foundations (hours 0–4, parallel)**
 
-- **DB**: migrations 001–004, SpatiaLite loaded, apply_migrations.py, basic CRUD helpers in `api/db.py`.
+- **DB**: migrations 001–003, SpatiaLite loaded, apply_migrations.py, basic CRUD helpers in `api/db.py`.
 - **API**: FastAPI scaffold, bearer auth, `/missions` + `/missions/join`, `/field` stub endpoints, `/mission/state.geojson` stub.
 - **Map data**: `fetch_terrain.py` runnable for Wilder Ranch bbox; hex_cells + osm_features populated.
 - **App**: existing Expo trimmed to launch screen + 3 tabs, `/field/me` polling working with mock data.
@@ -769,8 +753,8 @@ Parallelizable across teammates. Names below are role labels, not people.
 **Phase 3 — agent loop (10–14h)**
 
 - `agent/brief.py` implementation against real schema.
-- `agent_worker` polling loop: event diff, openclaw call, tool execution, journal write.
-- Triggers 1, 2, 3, 4 wired.
+- `workers/agent.py` one-shot: brief composition, nemoclaw invocation, tool execution. Wired to a cron schedule on DGX.
+- `POST /admin/agent/invoke` for synchronous force-fires.
 - Write skills: `reassign_searcher`, `broadcast`, `flag_hazard` (statically rasterized at init), `update_segment_poa`.
 
 **Phase 4 — demo polish (14–18h)**
