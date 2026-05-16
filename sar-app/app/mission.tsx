@@ -4,6 +4,7 @@ import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapView, { Callout, Marker, Polygon, Polyline, UrlTile, type Region } from 'react-native-maps';
 
+import FindingCalloutContent from './components/FindingCalloutContent';
 import FindingSheet from './components/FindingSheet';
 import MissionHud from './components/MissionHud';
 import {
@@ -417,6 +418,7 @@ export default function MissionView() {
       const [lon, lat] = f.geometry.coordinates;
       const color = FINDING_COLORS[f.properties.kind] ?? FINDING_COLORS.other;
       const { kind, description, confidence, ts } = f.properties;
+      const glyph = glyphFor(kind);
       return (
         <Marker
           // Server doesn't currently include finding.id in properties — fall
@@ -425,32 +427,26 @@ export default function MissionView() {
           key={`finding-${ts}-${i}`}
           coordinate={{ latitude: lat, longitude: lon }}
           anchor={{ x: 0.5, y: 1 }}
+          // CRITICAL: without this, every 5s state poll re-renders the
+          // Marker, and RN-maps closes any open Callout as part of the
+          // redraw. Symptom is "tap pin, preview flashes for ~500ms,
+          // disappears" — fixed by telling RN-maps to render the marker
+          // once and ignore subsequent child View changes.
+          tracksViewChanges={false}
         >
           <View style={[s.findingPin, { backgroundColor: color }]}>
-            <Text style={s.findingPinGlyph}>{glyphFor(kind)}</Text>
+            <Text style={s.findingPinGlyph}>{glyph}</Text>
           </View>
-          {/* Native callout — tap the pin to see a quick preview. The
-              tooltip="true" + no native callout container gives us a
-              custom-styled bubble instead of the default speech-bubble. */}
           <Callout tooltip>
-            <View style={s.findingCallout}>
-              <View style={s.findingCalloutRow}>
-                <View style={[s.findingCalloutSwatch, { backgroundColor: color }]}>
-                  <Text style={s.findingCalloutSwatchGlyph}>{glyphFor(kind)}</Text>
-                </View>
-                <Text style={s.findingCalloutKind}>{kind.replace('_', ' ')}</Text>
-              </View>
-              {description ? (
-                <Text style={s.findingCalloutDesc} numberOfLines={4}>
-                  {description}
-                </Text>
-              ) : (
-                <Text style={s.findingCalloutDescMuted}>No description.</Text>
-              )}
-              <Text style={s.findingCalloutMeta}>
-                {`Confidence ${Math.round(confidence * 100)}% · ${formatTime(ts)}`}
-              </Text>
-            </View>
+            <FindingCalloutContent
+              kind={kind}
+              description={description}
+              confidence={confidence}
+              ts={ts}
+              color={color}
+              glyph={glyph}
+              timeLabel={formatTime(ts)}
+            />
           </Callout>
         </Marker>
       );
@@ -1150,41 +1146,8 @@ const s = StyleSheet.create({
     lineHeight: 14,
   },
 
-  // Tooltip-mode callout — react-native-maps renders this as a floating
-  // bubble above the pin when tapped. Custom-styled (white card, rounded)
-  // since the default Apple Maps callout is iOS-only and visually
-  // mismatched with the rest of the app.
-  findingCallout: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    minWidth: 180,
-    maxWidth: 240,
-    shadowColor: '#000',
-    shadowOpacity: 0.18,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 3 },
-    gap: 4,
-  },
-  findingCalloutRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  findingCalloutSwatch: {
-    width: 18, height: 18, borderRadius: 9,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  findingCalloutSwatchGlyph: { color: '#fff', fontSize: 10, fontWeight: '700' },
-  findingCalloutKind: {
-    fontSize: 13, fontWeight: '700', color: '#0b0b0c',
-    textTransform: 'capitalize',
-  },
-  findingCalloutDesc: { fontSize: 12, color: '#0b0b0c', lineHeight: 16 },
-  findingCalloutDescMuted: {
-    fontSize: 12, color: '#6b6b73', fontStyle: 'italic',
-  },
-  findingCalloutMeta: {
-    fontSize: 10, color: '#6b6b73', marginTop: 2,
-    fontVariant: ['tabular-nums'],
-  },
+  // findingCallout* styles moved to components/FindingCalloutContent.tsx
+  // when the callout body was extracted for unit testing.
 
   // Text-only segment labels. White text + dark halo via textShadow so they
   // stay legible on any underlying hex colour. No pill background — the
