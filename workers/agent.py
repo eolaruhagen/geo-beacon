@@ -1,8 +1,8 @@
 """Parallel per-searcher routing agent worker.
 
 This replaces the old whole-mission brief loop. Each tick builds one local
-ASCII payload per searcher, sends those payloads to the LLM in parallel, then
-writes one cell-level dispatch per searcher.
+ASCII payload per searcher, sends those payloads to the LLM concurrently, then
+writes dispatches back to SQLite one at a time.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from scripts.apply_migrations import apply, DEFAULT_DB_PATH, DEFAULT_MIGRATIONS_
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PARALLELISM = 3
+DEFAULT_CONCURRENCY = 3
 DEFAULT_LOG_PATH = Path(tempfile.gettempdir()) / "geo-beacon" / "routing-agent.jsonl"
 
 ROUTER_SYSTEM_PROMPT = """You dispatch one search-and-rescue volunteer per call.
@@ -82,6 +82,10 @@ def _log_path(args: argparse.Namespace) -> Path | None:
     if not getattr(args, "log_enabled", True):
         return None
     return Path(getattr(args, "log_path", DEFAULT_LOG_PATH))
+
+
+def _concurrency(args: argparse.Namespace) -> int:
+    return int(getattr(args, "concurrency", getattr(args, "parallelism", DEFAULT_CONCURRENCY)))
 
 
 def _append_log(log_path: Path | None, record: dict[str, Any]) -> None:
@@ -321,7 +325,7 @@ def _dispatch_with_retry(
     raise last_error
 
 
-def _route_one(
+def _decide_one(
     context: DispatchContext,
     *,
     mode: str,
@@ -371,7 +375,6 @@ def _route_one(
             )
 
         target_hex_id = context.hex_id_for(decision.target_col, decision.target_row)
-        instruction = f"Move to local cell ({decision.target_col}, {decision.target_row})."
         decision_with_target = {**decision_dict, "target_hex_id": target_hex_id}
         _log_agent_call(
             log_path,
@@ -385,48 +388,14 @@ def _route_one(
             model_text=model_text,
         )
         agent_logged = True
-        dispatch = None
-        if not dry_run:
-            dispatch_started = time.time()
-            try:
-                dispatch = _dispatch_with_retry(
-                    user_id=context.user_id,
-                    target_hex_id=target_hex_id,
-                    reasoning=decision.reasoning,
-                    instruction=instruction,
-                    mission_id=context.mission_id,
-                )
-            except Exception as exc:
-                _log_dispatch_call(
-                    log_path,
-                    context,
-                    target_hex_id=target_hex_id,
-                    reasoning=decision.reasoning,
-                    instruction=instruction,
-                    duration_s=round(time.time() - dispatch_started, 2),
-                    status="error",
-                    error=str(exc),
-                )
-                raise
-            _log_dispatch_call(
-                log_path,
-                context,
-                target_hex_id=target_hex_id,
-                reasoning=decision.reasoning,
-                instruction=instruction,
-                duration_s=round(time.time() - dispatch_started, 2),
-                status="ok",
-                dispatch=dispatch,
-            )
 
         return RoutingResult(
             mission_id=context.mission_id,
             user_id=context.user_id,
             callsign=context.callsign,
-            status="dispatched" if not dry_run else "dry_run",
+            status="ready_to_dispatch" if not dry_run else "dry_run",
             duration_s=round(time.time() - started, 2),
             decision=decision_with_target,
-            dispatch=dispatch,
             model_text=model_text,
         )
     except Exception as exc:
@@ -451,6 +420,62 @@ def _route_one(
             error=str(exc),
             model_text=model_text,
         )
+
+
+def _write_dispatch_for_result(
+    context: DispatchContext,
+    result: RoutingResult,
+    log_path: Path | None,
+) -> RoutingResult:
+    if result.status != "ready_to_dispatch" or result.decision is None:
+        return result
+
+    target_hex_id = int(result.decision["target_hex_id"])
+    target_col = result.decision.get("target_col")
+    target_row = result.decision.get("target_row")
+    reasoning = str(result.decision.get("reasoning") or "Routing agent selected this local target.")
+    instruction = f"Move to local cell ({target_col}, {target_row})."
+    started = time.time()
+    try:
+        dispatch = _dispatch_with_retry(
+            user_id=context.user_id,
+            target_hex_id=target_hex_id,
+            reasoning=reasoning,
+            instruction=instruction,
+            mission_id=context.mission_id,
+        )
+    except Exception as exc:
+        duration_s = round(time.time() - started, 2)
+        _log_dispatch_call(
+            log_path,
+            context,
+            target_hex_id=target_hex_id,
+            reasoning=reasoning,
+            instruction=instruction,
+            duration_s=duration_s,
+            status="error",
+            error=str(exc),
+        )
+        result.status = "error"
+        result.duration_s = round(result.duration_s + duration_s, 2)
+        result.error = str(exc)
+        return result
+
+    duration_s = round(time.time() - started, 2)
+    _log_dispatch_call(
+        log_path,
+        context,
+        target_hex_id=target_hex_id,
+        reasoning=reasoning,
+        instruction=instruction,
+        duration_s=duration_s,
+        status="ok",
+        dispatch=dispatch,
+    )
+    result.status = "dispatched"
+    result.duration_s = round(result.duration_s + duration_s, 2)
+    result.dispatch = dispatch
+    return result
 
 
 def _contexts_for_tick(
@@ -519,12 +544,13 @@ def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
         skipped.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
         return skipped
 
-    max_workers = max(1, min(args.parallelism, len(contexts)))
+    contexts_by_user_id = {context.user_id: context for context in contexts}
+    max_workers = max(1, min(_concurrency(args), len(contexts)))
     results: list[RoutingResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
             pool.submit(
-                _route_one,
+                _decide_one,
                 context,
                 mode=args.mode,
                 timeout_seconds=args.timeout_seconds,
@@ -537,6 +563,14 @@ def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
         ]
         for future in as_completed(futures):
             results.append(future.result())
+    results.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
+    if not args.dry_run:
+        results = [
+            _write_dispatch_for_result(contexts_by_user_id[result.user_id], result, log_path)
+            if result.status == "ready_to_dispatch" and result.user_id in contexts_by_user_id
+            else result
+            for result in results
+        ]
     results.extend(skipped)
     results.sort(key=lambda item: (item.mission_id, item.callsign, item.user_id))
     return results
@@ -552,14 +586,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mission-id", type=int, default=None)
     parser.add_argument("--user-id", type=int, default=None)
     parser.add_argument("--max-searchers", type=int, default=0)
-    parser.add_argument("--parallelism", type=int, default=int(os.environ.get("ROUTING_AGENT_PARALLELISM", DEFAULT_PARALLELISM)))
+    parser.add_argument(
+        "--concurrency",
+        "--parallelism",
+        dest="concurrency",
+        type=int,
+        default=int(
+            os.environ.get(
+                "ROUTING_AGENT_CONCURRENCY",
+                os.environ.get("ROUTING_AGENT_PARALLELISM", DEFAULT_CONCURRENCY),
+            )
+        ),
+        help="Number of concurrent LLM routing calls. Dispatch DB writes still run sequentially.",
+    )
     parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=None,
         help="Optional per-searcher LLM timeout. Defaults to no timeout.",
     )
-    parser.add_argument("--interval-seconds", type=int, default=60)
+    parser.add_argument("--interval-seconds", type=int, default=int(os.environ.get("ROUTING_AGENT_INTERVAL_SECONDS", 30)))
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--skip-active", action="store_true", help="Do not re-route users who already have an active dispatch")
     parser.add_argument(
