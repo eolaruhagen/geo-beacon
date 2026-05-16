@@ -177,6 +177,24 @@ class DispatchActionResponse(BaseModel):
     user_status: str
 
 
+class RouteWaypoint(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+
+class RouteResponse(BaseModel):
+    """Snap-to-trail route from the searcher's last known position to the
+    target segment's entry point. Spec §13 query_route: snap only, no
+    along-trail path. App renders a polyline through `waypoints` in order.
+
+    `snapped`: false when the mission has no trail features (or the closest
+    is degenerate) — in that case `waypoints` is just [start, target] and
+    the app should render a bee-line.
+    """
+    waypoints: List[RouteWaypoint]
+    snapped: bool
+
+
 class MeResponse(BaseModel):
     user: UserPublic
     mission_id: Optional[int] = None

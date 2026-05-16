@@ -5,7 +5,7 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.auth import current_user
 from api.db import session
@@ -25,12 +25,15 @@ from api.schemas import (
     MeResponse,
     PingRequest,
     PingResponse,
+    RouteResponse,
+    RouteWaypoint,
     UserPublic,
 )
 import api.db.dispatches as db_dispatches
 import api.db.missions as db_missions
 import api.db.pings as db_pings
 import api.db.users as db_users
+from api.db.routing import snap_point_to_nearest_trail
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +165,71 @@ async def dispatch_complete(
     return _apply_dispatch_action(
         dispatch_id, "complete", user, completion_notes=body.notes,
     )
+
+
+@router.get("/me/route", response_model=RouteResponse)
+async def field_me_route(
+    segment_id: int = Query(..., description="Target segment id (must be in the user's active mission)"),
+    user: dict = Depends(current_user),
+) -> RouteResponse:
+    """Snap-to-trail route from the user's last known position to the target
+    segment's entry point. Spec §13: snap only, no along-trail graph routing.
+
+    Resolution order for the start point: most recent ping → mission PLS.
+    Resolution order for the target point: active dispatch entry_lat/lon
+    if it matches this segment → segment centroid.
+    """
+    mission_id = db_missions.active_mission_id_for_user(user["id"])
+    if mission_id is None:
+        raise HTTPException(status_code=409, detail="No active mission for this user")
+
+    with session() as conn:
+        seg = conn.execute(
+            """
+            SELECT id, X(Centroid(geom)) AS clon, Y(Centroid(geom)) AS clat
+            FROM segments WHERE id = ? AND mission_id = ?
+            """,
+            (segment_id, mission_id),
+        ).fetchone()
+    if seg is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Segment {segment_id} not found in this mission",
+        )
+
+    # Start: latest ping → PLS fallback.
+    latest = db_pings.latest_ping_for_user(user["id"], mission_id)
+    if latest is not None:
+        start_lat, start_lon = float(latest["lat"]), float(latest["lon"])
+    else:
+        mission = db_missions.get_mission(mission_id)
+        # mission can't be None here — active_mission_id_for_user just returned it.
+        start_lat, start_lon = float(mission["pls_lat"]), float(mission["pls_lon"])
+
+    # Target: prefer the active dispatch's entry point when it's for this
+    # segment, otherwise the segment centroid.
+    target_lat = float(seg["clat"])
+    target_lon = float(seg["clon"])
+    active = db_dispatches.active_dispatch_for_user(user["id"])
+    if (active is not None
+            and active.get("segment_id") == segment_id
+            and active.get("entry_lat") is not None
+            and active.get("entry_lon") is not None):
+        target_lat = float(active["entry_lat"])
+        target_lon = float(active["entry_lon"])
+
+    snap_start = snap_point_to_nearest_trail(mission_id, start_lat, start_lon)
+    snap_target = snap_point_to_nearest_trail(mission_id, target_lat, target_lon)
+
+    waypoints: list[RouteWaypoint] = [RouteWaypoint(lat=start_lat, lon=start_lon)]
+    snapped = False
+    if snap_start is not None and snap_target is not None:
+        waypoints.append(RouteWaypoint(lat=snap_start[0], lon=snap_start[1]))
+        waypoints.append(RouteWaypoint(lat=snap_target[0], lon=snap_target[1]))
+        snapped = True
+    waypoints.append(RouteWaypoint(lat=target_lat, lon=target_lon))
+
+    return RouteResponse(waypoints=waypoints, snapped=snapped)
 
 
 @router.post("/findings", response_model=FindingResponse, status_code=201)
