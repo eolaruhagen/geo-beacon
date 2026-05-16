@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+
+# Local DB + terrain cache (on DGX, lives at /home/asus/sqlite/)
+*.db
+*.db-wal
+*.db-shm
+data/
+logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+.env.local
+.dgx-pass
