@@ -14,6 +14,7 @@ from api.db.hex_cells import (
     hex_cell_id_at,
     hex_cells_for_mission,
     mark_hex_searched,
+    mark_segment_searched,
     rasterize_hazard_to_hex_flags,
     set_flag_clue_for_hex,
 )
@@ -185,6 +186,30 @@ def _apply_dispatch_action(
     if new_user_status is not None:
         db_users.set_user_status(user["id"], new_user_status)
         user_status_after = new_user_status
+
+    # On /complete: mark every hex cell in the dispatched segment as searched
+    # by this user. Per spec, completing a dispatch means the searcher
+    # certifies the whole segment is covered — the per-cell flag_searched
+    # already gets set incrementally by /field/ping as they walk, but for
+    # cells they didn't physically step into this fills in the gaps so the
+    # UI coverage tint matches reality. No-op when segment_id is null
+    # (recall dispatches, where there's no segment to mark).
+    if action == "complete" and d.get("segment_id") is not None:
+        try:
+            mark_segment_searched(
+                mission_id=d["mission_id"],
+                segment_id=d["segment_id"],
+                user_id=user["id"],
+                ts=int(time.time()),
+            )
+        except Exception as e:
+            # Coverage update is best-effort; don't fail the lifecycle action
+            # because of a stray UPDATE error. The status flip is the
+            # authoritative signal.
+            logger.error(
+                "mark_segment_searched failed for dispatch %s: %s",
+                dispatch_id, e,
+            )
 
     return DispatchActionResponse(
         dispatch_id=dispatch_id,
