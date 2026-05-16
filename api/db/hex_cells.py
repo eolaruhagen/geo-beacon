@@ -108,9 +108,17 @@ def set_flag_clue_for_hex(hex_id: int) -> None:
 
 
 def mark_hex_searched(hex_id: int, user_id: int, ts: int) -> None:
-    """Mark a hex cell as covered by a searcher's ping. Idempotent at the
-    cell level — repeated calls update searched_by_user_id and searched_ts
-    (last-writer-wins) but flag_searched stays set.
+    """Mark a hex cell as covered by a searcher's ping.
+
+    **First-writer-wins**: once a cell is `flag_searched = 1`, this is a
+    no-op. Attribution (`searched_by_user_id`, `searched_ts`) is
+    frozen at the first searcher whose ping landed inside.
+
+    This rule keeps per-searcher coverage tints stable: two searchers
+    crossing paths don't flicker each other's territory on the map.
+    The "who got there first" data is also more useful than a
+    last-writer-wins overwrite — for SAR coverage analysis, first
+    contact is the canonical event.
     """
     with session() as conn:
         conn.execute(
@@ -119,7 +127,7 @@ def mark_hex_searched(hex_id: int, user_id: int, ts: int) -> None:
             SET flag_searched = 1,
                 searched_by_user_id = ?,
                 searched_ts = ?
-            WHERE id = ?
+            WHERE id = ? AND flag_searched = 0
             """,
             (user_id, ts, hex_id),
         )
@@ -128,16 +136,18 @@ def mark_hex_searched(hex_id: int, user_id: int, ts: int) -> None:
 def mark_segment_searched(
     mission_id: int, segment_id: int, user_id: int, ts: int,
 ) -> int:
-    """Mark every hex cell in `segment_id` as searched by `user_id`.
+    """Mark every UNSEARCHED hex cell in `segment_id` as searched by `user_id`.
 
-    Called from POST /field/dispatch/{id}/complete: when a searcher closes
-    out a dispatch the system treats the whole segment as covered.
-    Existing flag_searched=1 cells get their searched_by_user_id /
-    searched_ts overwritten (last-writer-wins, same as the per-ping path);
-    if you'd rather preserve attribution per cell, gate this on
-    `flag_searched = 0` in the WHERE clause.
+    Called from POST /field/dispatch/{id}/complete: when a searcher
+    closes out a dispatch the system fills in coverage for cells they
+    didn't physically walk through.
 
-    Returns the count of cells touched.
+    Same first-writer-wins rule as `mark_hex_searched`: cells already
+    `flag_searched = 1` (whether by an earlier ping or an earlier
+    completed dispatch from someone else) are left untouched.
+    Attribution is sticky once set.
+
+    Returns the count of cells newly flagged on this call.
     """
     with session() as conn:
         cur = conn.execute(
@@ -146,7 +156,7 @@ def mark_segment_searched(
             SET flag_searched = 1,
                 searched_by_user_id = ?,
                 searched_ts = ?
-            WHERE mission_id = ? AND segment_id = ?
+            WHERE mission_id = ? AND segment_id = ? AND flag_searched = 0
             """,
             (user_id, ts, mission_id, segment_id),
         )

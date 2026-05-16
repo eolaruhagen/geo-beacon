@@ -356,8 +356,12 @@ export default function MissionView() {
             latitude: lat,
             longitude: lon,
           }))}
-          strokeColor="rgba(0,0,0,0.28)"
-          strokeWidth={0.5}
+          // Bumped from 0.5px/0.28α — CartoDB Positron is nearly grayscale
+          // and the previous strokes vanished once many cells filled with
+          // coverage tint at α≈0.22. 0.85px / 0.42α reads cleanly without
+          // dominating the fill.
+          strokeColor="rgba(0,0,0,0.42)"
+          strokeWidth={0.85}
           fillColor={fillFor(effective, selfUserId)}
         />
       );
