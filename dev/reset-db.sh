@@ -10,8 +10,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 VENV_DIR="$REPO_ROOT/.venv"
-DB_DIR="$REPO_ROOT/dev/data"
-DB_PATH="$DB_DIR/mission.db"
+DB_PATH="${MISSION_DB_PATH:-$REPO_ROOT/dev/data/mission.db}"
+DB_DIR="$(dirname "$DB_PATH")"
 
 bold() { printf "\033[1m%s\033[0m\n" "$1"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$1"; }
