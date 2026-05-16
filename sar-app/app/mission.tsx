@@ -385,34 +385,25 @@ export default function MissionView() {
       })
       .map((seg) => {
       const c = polygonCentroid(seg.geometry.coordinates[0]);
-      const strokeColor = SEGMENT_STATUS_COLOR[seg.properties.status];
       const assigneeUserId = seg.properties.assigned_user_id;
       const assigneeColor =
         assigneeUserId != null ? colorForUser(assigneeUserId) : null;
-      const assigneeInitial =
-        assigneeUserId != null
-          ? (callsignByUserId[assigneeUserId]?.[0] ?? '?').toUpperCase()
-          : null;
+      // Subtle text-only label. White text with a dark halo (textShadow) so
+      // it reads on any underlying tile colour. No background pill, no
+      // border — the segment outline already encodes status.
+      // The assignee dot rides next to the name (no chip background).
       return (
         <Marker
           key={`segment-label-${seg.properties.id}`}
           coordinate={c}
-          // y > 0.5 pulls the label down off the centroid so a searcher dot
-          // that lands at the centroid peeks above the pill.
-          anchor={{ x: 0.5, y: 0.65 }}
+          anchor={{ x: 0.5, y: 0.5 }}
+          tracksViewChanges={false}
         >
-          <View style={[s.segmentLabel, { borderColor: strokeColor }]}>
-            <View style={s.segmentLabelRow}>
-              <Text style={s.segmentLabelName}>{seg.properties.name}</Text>
-              {assigneeColor && (
-                <View style={[s.segmentAssigneeChip, { backgroundColor: assigneeColor }]}>
-                  <Text style={s.segmentAssigneeChipText}>{assigneeInitial}</Text>
-                </View>
-              )}
-            </View>
-            <Text style={s.segmentLabelStats}>
-              {`POA ${pct(seg.properties.poa)} · POD ${pct(seg.properties.pod)}`}
-            </Text>
+          <View style={s.segmentLabelRow} pointerEvents="none">
+            <Text style={s.segmentLabelName}>{seg.properties.name}</Text>
+            {assigneeColor && (
+              <View style={[s.segmentAssigneeDot, { backgroundColor: assigneeColor }]} />
+            )}
           </View>
         </Marker>
       );
@@ -558,7 +549,10 @@ function regionFromGrid(g: HexGrid): Region | null {
 //   camera. 0.5 = inner 50% box, which is roughly the user's fovea on a
 //   handheld phone.
 const LABEL_ZOOM_LAT_DELTA = 0.005;
-const LABEL_FOCAL_FRACTION = 0.5;
+// Wider fovea now that labels are just halo'd text instead of pills — the
+// visual noise per label is much lower, so we can show more without the
+// map turning into label soup.
+const LABEL_FOCAL_FRACTION = 0.8;
 
 const ACCENT = '#d6362f';
 const SELF_TRACK_COLOR = '#5a6cf2';
@@ -628,40 +622,56 @@ function polygonCentroid(ring: number[][]): { latitude: number; longitude: numbe
 }
 
 function MapLegend() {
+  // Top-left mini-legend, collapsed by default so it doesn't crowd the map
+  // controls or the broadcast banner. Tap the header to expand.
+  const [expanded, setExpanded] = useState(false);
   return (
-    <View style={s.legend} pointerEvents="none">
-      <Text style={s.legendEyebrow}>LEGEND</Text>
-      <LegendRow
-        swatch={<View style={[s.legendDot, { backgroundColor: '#007AFF' }]} />}
-        label="You"
-      />
-      <LegendRow
-        swatch={<View style={[s.legendDot, { backgroundColor: SEARCHER_COLORS[2] }]} />}
-        label="Teammate"
-      />
-      <LegendRow
-        swatch={<View style={[s.legendLine, { backgroundColor: SEARCHER_COLORS[2] }]} />}
-        label="Track"
-      />
-      <LegendRow swatch={<View style={s.legendZone} />} label="Zone" />
-      <LegendRow swatch={<View style={s.legendSearched} />} label="Searched" />
-      <LegendRow
-        swatch={
-          <View style={[s.legendFinding, { backgroundColor: FINDING_COLORS.clue }]}>
-            <Text style={s.legendFindingGlyph}>?</Text>
-          </View>
-        }
-        label="Finding"
-      />
-      <LegendRow swatch={<View style={s.legendHazard} />} label="Hazard" />
-      <LegendRow
-        swatch={<View style={[s.legendLine, { backgroundColor: 'rgba(139,111,71,0.55)' }]} />}
-        label="Trail"
-      />
-      <LegendRow
-        swatch={<View style={[s.legendLine, { backgroundColor: 'rgba(0,0,0,0.45)' }]} />}
-        label="Route"
-      />
+    <View style={s.legend}>
+      <Pressable
+        onPress={() => setExpanded((v) => !v)}
+        style={({ pressed }) => [s.legendHeader, pressed && s.legendHeaderPressed]}
+        hitSlop={4}
+        accessibilityRole="button"
+        accessibilityLabel={expanded ? 'Collapse legend' : 'Expand legend'}
+      >
+        <Text style={s.legendEyebrow}>LEGEND</Text>
+        <Text style={s.legendChevron}>{expanded ? '▾' : '▸'}</Text>
+      </Pressable>
+      {expanded ? (
+        <View style={s.legendBody} pointerEvents="none">
+          <LegendRow
+            swatch={<View style={[s.legendDot, { backgroundColor: '#007AFF' }]} />}
+            label="You"
+          />
+          <LegendRow
+            swatch={<View style={[s.legendDot, { backgroundColor: SEARCHER_COLORS[2] }]} />}
+            label="Teammate"
+          />
+          <LegendRow
+            swatch={<View style={[s.legendLine, { backgroundColor: SEARCHER_COLORS[2] }]} />}
+            label="Track"
+          />
+          <LegendRow swatch={<View style={s.legendZone} />} label="Zone" />
+          <LegendRow swatch={<View style={s.legendSearched} />} label="Searched" />
+          <LegendRow
+            swatch={
+              <View style={[s.legendFinding, { backgroundColor: FINDING_COLORS.clue }]}>
+                <Text style={s.legendFindingGlyph}>?</Text>
+              </View>
+            }
+            label="Finding"
+          />
+          <LegendRow swatch={<View style={s.legendHazard} />} label="Hazard" />
+          <LegendRow
+            swatch={<View style={[s.legendLine, { backgroundColor: 'rgba(139,111,71,0.55)' }]} />}
+            label="Trail"
+          />
+          <LegendRow
+            swatch={<View style={[s.legendLine, { backgroundColor: 'rgba(0,0,0,0.45)' }]} />}
+            label="Route"
+          />
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -823,55 +833,37 @@ const s = StyleSheet.create({
     lineHeight: 14,
   },
 
-  // Translucent pill (no native backdrop-filter in RN — pure rgba white). Lower
-  // alpha than the top pill so flagged hex cells underneath bleed through.
-  segmentLabel: {
-    backgroundColor: 'rgba(255,255,255,0.75)',
-    borderWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 8,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.10,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 2 },
-  },
+  // Text-only segment labels. White text + dark halo via textShadow so they
+  // stay legible on any underlying hex colour. No pill background — the
+  // segment outline already encodes status. Tap targets aren't needed
+  // because the label is decorative (handler-free).
   segmentLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  segmentLabelName: { fontSize: 13, fontWeight: '600', color: '#0b0b0c' },
-  segmentLabelStats: {
-    fontSize: 10,
-    fontWeight: '600',
-    fontVariant: ['tabular-nums'],
-    marginTop: 1,
-    color: '#3c3c43',  // neutral, decoupled from status (one signal per channel)
-  },
-  segmentAssigneeChip: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  segmentAssigneeChipText: {
-    color: '#fff',
-    fontSize: 8,
+  segmentLabelName: {
+    fontSize: 12,
     fontWeight: '700',
-    lineHeight: 10,
+    color: '#fff',
+    // Halo: zero-offset shadow with a small radius mimics a thin dark stroke
+    // on every edge. Strong enough to read over light + dark terrain.
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
+  },
+  segmentAssigneeDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.95)',
   },
 
-  // Floating mini-legend. Bottom-left, above the chat FAB visually. Decorative
-  // only — pointerEvents="none" on the parent so map taps pass through. Listed
-  // entries include layers we haven't shipped yet (Hazard polygon fill, Route
-  // line) so the key already reads correctly when those land.
+  // Top-left mini-legend. Collapsed by default — only the header pill shows
+  // until the user taps to expand. Sits below the title pill (top ≈ 70)
+  // and above the FindingSheet's bottom area.
   legend: {
     position: 'absolute',
-    bottom: 100,
+    top: 70,
     left: 12,
     width: 130,
-    paddingHorizontal: 10,
-    paddingTop: 8,
-    paddingBottom: 8,
     borderRadius: 12,
     backgroundColor: 'rgba(255,255,255,0.92)',
     borderWidth: StyleSheet.hairlineWidth,
@@ -880,13 +872,26 @@ const s = StyleSheet.create({
     shadowOpacity: 0.08,
     shadowRadius: 18,
     shadowOffset: { width: 0, height: 6 },
+    overflow: 'hidden',
   },
+  legendHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  legendHeaderPressed: { opacity: 0.6 },
+  legendBody: {
+    paddingHorizontal: 10,
+    paddingBottom: 8,
+  },
+  legendChevron: { fontSize: 11, color: '#6b6b73', fontWeight: '700' },
   legendEyebrow: {
     fontSize: 9,
     fontWeight: '700',
     letterSpacing: 0.8,
     color: '#6b6b73',
-    marginBottom: 6,
   },
   legendRow: {
     flexDirection: 'row',
