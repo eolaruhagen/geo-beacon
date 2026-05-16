@@ -1,29 +1,41 @@
 -- Base non-spatial tables.
 -- Spatial tables (pings, segments, findings, hazards) live in 002.
--- Terrain tables (terrain_cells, osm_features) live in 003.
--- Coordination tables (agent_journal, agent_invocation_queue, coverage_cache) live in 004.
+-- Hex grid + OSM cache (hex_cells, hex_visits, osm_features) live in 003.
+-- Agent journal lives in 004.
+--
+-- Auth model: per-user bearer_token generated at join time. Mission creator is the
+-- admin via missions.created_by_user_id; no separate admin role. Mission has a
+-- shareable join_code so other searchers (and observers) can opt in from the app.
+--
+-- Agent invocation model: no queue. agent_worker polls on a tick, comparing
+-- missions.last_agent_invocation_ts against events. force_agent_invoke=1 lets a
+-- handler short-circuit the next tick (used for subject_found + commander_override).
 
 CREATE TABLE users (
   id            INTEGER PRIMARY KEY,
   display_name  TEXT    NOT NULL,
   callsign      TEXT    UNIQUE,    -- 'Alpha', 'Bravo', ...; null for observers
   phone         TEXT,
-  role          TEXT    NOT NULL CHECK (role IN ('searcher', 'team_leader', 'observer')),
+  role          TEXT    NOT NULL CHECK (role IN ('searcher', 'observer')) DEFAULT 'searcher',
   status        TEXT    NOT NULL CHECK (status IN ('standby', 'dispatched', 'on_segment', 'returning', 'no_comms', 'off_duty')) DEFAULT 'standby',
   bearer_token  TEXT    NOT NULL UNIQUE,
   created_ts    INTEGER NOT NULL
 );
 
 CREATE TABLE missions (
-  id                   INTEGER PRIMARY KEY,
-  name                 TEXT    NOT NULL,
-  status               TEXT    NOT NULL CHECK (status IN ('planning', 'active', 'subject_found', 'suspended', 'ended')),
-  subject_description  TEXT    NOT NULL,
-  pls_lat              REAL    NOT NULL,
-  pls_lon              REAL    NOT NULL,
-  pls_ts               INTEGER NOT NULL,
-  started_ts           INTEGER NOT NULL,
-  ended_ts             INTEGER
+  id                       INTEGER PRIMARY KEY,
+  name                     TEXT    NOT NULL,
+  status                   TEXT    NOT NULL CHECK (status IN ('planning', 'active', 'subject_found', 'suspended', 'ended')),
+  subject_description      TEXT    NOT NULL,
+  pls_lat                  REAL    NOT NULL,
+  pls_lon                  REAL    NOT NULL,
+  pls_ts                   INTEGER NOT NULL,
+  join_code                TEXT    NOT NULL UNIQUE,                -- short shareable string
+  created_by_user_id       INTEGER NOT NULL REFERENCES users(id),  -- mission creator = admin
+  started_ts               INTEGER NOT NULL,
+  ended_ts                 INTEGER,
+  last_agent_invocation_ts INTEGER NOT NULL DEFAULT 0,             -- agent_worker high-watermark
+  force_agent_invoke       INTEGER NOT NULL DEFAULT 0              -- 1 = next tick must invoke
   -- area_geom POLYGON added in 002 via AddGeometryColumn
 );
 
@@ -34,7 +46,7 @@ CREATE TABLE dispatches (
   id              INTEGER PRIMARY KEY,
   mission_id      INTEGER NOT NULL REFERENCES missions(id),
   user_id         INTEGER NOT NULL REFERENCES users(id),
-  segment_id      INTEGER REFERENCES segments(id),
+  segment_id      INTEGER REFERENCES segments(id),     -- NULL for recall / staging move
   sweep_type      TEXT    CHECK (sweep_type IN ('hasty', 'efficient', 'thorough')),
   entry_lat       REAL,
   entry_lon       REAL,
