@@ -28,6 +28,12 @@ HazardSeverity = Literal[
 
 UserRole = Literal["searcher", "observer"]  # migrations/001_init.sql:19 (users.role CHECK)
 
+DispatchStatus = Literal[
+    "pending", "acked", "in_progress", "completed", "cancelled", "superseded"
+]  # migrations/001_init.sql:59 (dispatches.status CHECK)
+
+SweepType = Literal["hasty", "efficient", "thorough"]  # migrations/001_init.sql:54
+
 
 class HazardInput(BaseModel):
     # H-2: hazards.geom is registered as POLYGON (singular) in
@@ -141,13 +147,43 @@ class UserPublic(BaseModel):
     current_mission_id: Optional[int]
 
 
+class ActiveDispatch(BaseModel):
+    """Single in-flight dispatch for a searcher (status in pending/acked/in_progress)."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    mission_id: int
+    user_id: int
+    segment_id: Optional[int]
+    sweep_type: Optional[SweepType]
+    entry_lat: Optional[float]
+    entry_lon: Optional[float]
+    instruction: str
+    reasoning: str
+    status: DispatchStatus
+    issued_ts: int
+    acked_ts: Optional[int]
+    started_ts: Optional[int]
+    completed_ts: Optional[int]
+
+
+class DispatchCompleteRequest(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class DispatchActionResponse(BaseModel):
+    dispatch_id: int
+    status: DispatchStatus
+    user_status: str
+
+
 class MeResponse(BaseModel):
     user: UserPublic
     mission_id: Optional[int] = None
-    # active_dispatch / segment_geojson will become populated optionals when the
-    # dispatch endpoints land (SPEC-2). For now they're null but the field types
-    # are Optional[Any] so the wire shape stays stable across that change.
-    active_dispatch: Optional[Any] = None
-    segment_geojson: Optional[Any] = None
+    active_dispatch: Optional[ActiveDispatch] = None
+    # GeoJSON Feature for the active dispatch's segment (with properties:
+    # name, poa, pod, sweep_type, terrain stats). None when no active dispatch
+    # or the dispatch is a recall (segment_id NULL).
+    segment_geojson: Optional[dict[str, Any]] = None
     nearby_hazards: List = Field(default_factory=list)
     recent_broadcasts: List = Field(default_factory=list)

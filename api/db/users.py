@@ -56,6 +56,17 @@ def set_current_mission(user_id: int, mission_id: int) -> None:
         )
 
 
+def set_user_status(user_id: int, status: str) -> None:
+    """Update users.status. CHECK constraint in 001_init.sql enforces the
+    allowed values ('standby','dispatched','on_segment','returning',
+    'no_comms','off_duty') — sqlite3 raises IntegrityError on a bad value."""
+    with session() as conn:
+        conn.execute(
+            "UPDATE users SET status = ? WHERE id = ?",
+            (status, user_id),
+        )
+
+
 def get_user_by_token(token: str) -> dict | None:
     """Bearer-token lookup. Returns full user row or None."""
     with session() as conn:

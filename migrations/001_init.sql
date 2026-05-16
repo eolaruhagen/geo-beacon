@@ -56,12 +56,13 @@ CREATE TABLE dispatches (
   entry_lon       REAL,
   instruction     TEXT    NOT NULL,
   reasoning       TEXT    NOT NULL,
-  status          TEXT    NOT NULL CHECK (status IN ('pending', 'acked', 'in_progress', 'completed', 'cancelled', 'superseded')),
-  issued_ts       INTEGER NOT NULL,
-  acked_ts        INTEGER,
-  started_ts      INTEGER,
-  completed_ts    INTEGER,
-  superseded_by   INTEGER REFERENCES dispatches(id)
+  status            TEXT    NOT NULL CHECK (status IN ('pending', 'acked', 'in_progress', 'completed', 'cancelled', 'superseded')),
+  issued_ts         INTEGER NOT NULL,
+  acked_ts          INTEGER,
+  started_ts        INTEGER,
+  completed_ts      INTEGER,
+  completion_notes  TEXT,                                -- optional searcher note at /complete; spec §13
+  superseded_by     INTEGER REFERENCES dispatches(id)
 );
 CREATE INDEX idx_dispatches_user_status    ON dispatches (user_id, status);
 CREATE INDEX idx_dispatches_mission_issued ON dispatches (mission_id, issued_ts DESC);
