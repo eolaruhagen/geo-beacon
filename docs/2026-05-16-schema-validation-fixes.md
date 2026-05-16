@@ -4,26 +4,28 @@ Fixes for the issues surfaced during the recent review. Each item is tied to its
 
 ## What landed
 
-### Migration
+### Migrations
 
-- **`migrations/004_user_mission_and_validation.sql`** — single new migration that:
-  - Adds `users.current_mission_id INTEGER REFERENCES missions(id)` plus index.
-  - Drops the global `UNIQUE(callsign)` on users, replaces with `UNIQUE(current_mission_id, callsign)`.
-  - Makes `findings.description` nullable.
-  - Uses the SQLite rename-and-copy pattern (with `DiscardGeometryColumn`/`AddGeometryColumn` around the `findings` rebuild so SpatiaLite metadata stays consistent).
+No new migration file. Since the dev DB is throwaway, the canonical schema in `migrations/001_init.sql` and `migrations/002_spatial.sql` was edited directly:
 
-You don't need to do anything special — the migration runner picks it up on next worker / API startup.
+- **`migrations/001_init.sql`** — `users` definition updated:
+  - Added `current_mission_id INTEGER REFERENCES missions(id)`.
+  - Replaced global `UNIQUE(callsign)` with `UNIQUE(current_mission_id, callsign)`.
+  - Added `idx_users_mission` index on `current_mission_id`.
+- **`migrations/002_spatial.sql`** — `findings.description` is now nullable.
+
+**Upgrade path on existing dev DBs**: delete `~/sqlite/mission.db` (or your local equivalent) and let the migration runner re-apply from scratch on next worker / API startup. Since `schema_migrations` tracks by filename, an already-applied 001 won't re-run automatically with the new content — wipe is required.
 
 ### Code changes by issue code
 
 | Code | Severity | Where | What changed |
 |---|---|---|---|
 | **F-1** | critical | `api/routes/field.py` | `POST /field/findings` was 500ing on every call. Fixed column names (`reporter_user_id`, `ts`), now writes the NOT NULL `geom POINT` via `SetSRID(MakePoint(lon, lat), 4326)`. Also added the hex-marking branch: `kind='hazard'` now also inserts a hazards row (polygon = containing hex's geom) and rasterizes to `flag_danger`. Failed hex lookup now returns 422 instead of swallowing and 500ing on NULL hex_id. |
-| **F-2** | medium | migration 004 + `api/schemas.py` | `findings.description` is now nullable both in the DB and on the wire. `FindingRequest.description: Optional[str]` was already optional; the migration matches it. |
+| **F-2** | medium | `migrations/002_spatial.sql` + `api/schemas.py` | `findings.description` is now nullable both in the DB and on the wire. `FindingRequest.description: Optional[str]` was already optional; the schema matches it. |
 | **F-3** | medium | `api/schemas.py` | `FindingRequest.kind` is now `Literal[...]` matching the DB CHECK exactly (`clue`, `subject_found`, `subject_sighting`, `hazard`, `footprint`, `discarded_item`, `note`, `other`). Bogus kinds rejected with 422 by Pydantic before they hit the DB. |
 | **H-2** | medium | `api/schemas.py` | `HazardInput.poly_geojson` now rejects `MultiPolygon`. `hazards.geom` is registered as POLYGON; SpatiaLite would have 500'd at INSERT. |
 | **MI-1** | medium | `api/schemas.py` | `CreateMissionRequest.area_geojson` rejects `MultiPolygon` for the same reason on `missions.area_geom`. |
-| **U-1** | low (workaround existed) | migration 004 + `api/db/users.py`, `api/db/missions.py`, `api/routes/missions.py` | `users.callsign` is now per-mission UNIQUE via `(current_mission_id, callsign)`. The `_disambiguate_callsign` workaround (Alpha → Alpha-2) is gone. Same callsign in the same mission now returns a clean 409 from `/missions/join`. `active_mission_id_for_user` reads `users.current_mission_id` directly (with the previous created-by/pings inference as a defensive fallback). `POST /missions` sets the creator's `current_mission_id` automatically; `POST /missions/join` sets the joiner's. |
+| **U-1** | low (workaround existed) | `migrations/001_init.sql` + `api/db/users.py`, `api/db/missions.py`, `api/routes/missions.py` | `users.callsign` is now per-mission UNIQUE via `(current_mission_id, callsign)`. The `_disambiguate_callsign` workaround (Alpha → Alpha-2) is gone. Same callsign in the same mission now returns a clean 409 from `/missions/join`. `active_mission_id_for_user` reads `users.current_mission_id` directly (with the previous created-by/pings inference as a defensive fallback). `POST /missions` sets the creator's `current_mission_id` automatically; `POST /missions/join` sets the joiner's. |
 | **HC-1** | cosmetic | `scripts/fetch_terrain.py` | `hex_cells` actually stores hexagons now. Switched to flat-top hexes on an odd-r offset grid. Each cell has 6 unique vertices. ~5000 cells per 2×2km mission area is unchanged. `scripts/seed_hex_cells.py` didn't need changes — the segment bucket lookup keys on hex centroid lat/lon, not on hex topology. |
 
 ### Pydantic audit notes

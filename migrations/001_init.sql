@@ -11,16 +11,22 @@
 -- compose a brief, invokes nemoclaw, and exits. Agent memory / reasoning history
 -- lives in nemoclaw's own memory files on disk, not in the database.
 
+-- callsign is scoped UNIQUE(current_mission_id, callsign) — same callsign can
+-- coexist across missions, only collides within a single mission. current_mission_id
+-- is the user's active mission affiliation; set by /missions create + /missions/join.
 CREATE TABLE users (
-  id            INTEGER PRIMARY KEY,
-  display_name  TEXT    NOT NULL,
-  callsign      TEXT    UNIQUE,    -- 'Alpha', 'Bravo', ...; null for observers
-  phone         TEXT,
-  role          TEXT    NOT NULL CHECK (role IN ('searcher', 'observer')) DEFAULT 'searcher',
-  status        TEXT    NOT NULL CHECK (status IN ('standby', 'dispatched', 'on_segment', 'returning', 'no_comms', 'off_duty')) DEFAULT 'standby',
-  bearer_token  TEXT    NOT NULL UNIQUE,
-  created_ts    INTEGER NOT NULL
+  id                  INTEGER PRIMARY KEY,
+  display_name        TEXT    NOT NULL,
+  callsign            TEXT,                      -- 'Alpha', 'Bravo', ...; null for observers
+  phone               TEXT,
+  role                TEXT    NOT NULL CHECK (role IN ('searcher', 'observer')) DEFAULT 'searcher',
+  status              TEXT    NOT NULL CHECK (status IN ('standby', 'dispatched', 'on_segment', 'returning', 'no_comms', 'off_duty')) DEFAULT 'standby',
+  bearer_token        TEXT    NOT NULL UNIQUE,
+  current_mission_id  INTEGER REFERENCES missions(id),
+  created_ts          INTEGER NOT NULL,
+  UNIQUE (current_mission_id, callsign)
 );
+CREATE INDEX idx_users_mission ON users (current_mission_id);
 
 CREATE TABLE missions (
   id                       INTEGER PRIMARY KEY,
