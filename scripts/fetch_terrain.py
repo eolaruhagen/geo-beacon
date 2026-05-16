@@ -226,7 +226,13 @@ def _fetch_real(
     import rasterio
     from rasterio.transform import from_bounds
 
-    TIMEOUT = 5  # seconds per request
+    TIMEOUT = 15  # seconds per request — Overpass can be slow
+    # Overpass + Open-Elevation enforce a real User-Agent (anonymous python-requests
+    # gets 406 Not Acceptable). Identify the app + contact per OSM etiquette.
+    HEADERS = {
+        "User-Agent": "geo-beacon-sar/0.1 (hackathon SAR mission control; contact: e.olaruhagen@gmail.com)",
+        "Accept": "application/json",
+    }
 
     cells: list[dict] = []
     osm_features: list[dict] = []
@@ -256,6 +262,7 @@ def _fetch_real(
             resp = requests.post(
                 "https://api.open-elevation.com/api/v1/lookup",
                 json={"locations": chunk},
+                headers=HEADERS,
                 timeout=TIMEOUT,
             )
             resp.raise_for_status()
@@ -312,6 +319,7 @@ out geom;
         resp = requests.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": overpass_query},
+            headers=HEADERS,
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
