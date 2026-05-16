@@ -29,24 +29,40 @@ phone via the ngrok URL → inspect `dev/data/mission.db` with `sqlite3`.
 ## Prerequisites
 
 - macOS (Apple Silicon or Intel) — Linux works too with apt-equivalent steps
-- Python 3.12+
-- Homebrew
+- A Python interpreter that supports sqlite **extension loading** — Apple's
+  `/usr/bin/python3` does NOT. Any of these work:
+  - Homebrew: `brew install python@3.12`
+  - Conda: any env you create yourself (`conda create -n geo python=3.12`)
+  - Pyenv: `PYTHON_CONFIGURE_OPTS="--enable-loadable-sqlite-extensions" pyenv install 3.12.5`
+- Homebrew (for `libspatialite` + `ngrok`)
 
 ## One-time setup
 
 ```bash
+# Default — uses whatever python3 is on PATH:
 ./dev/setup.sh
+
+# Or point at a specific interpreter (recommended on macOS, since the default
+# python3 is Apple's and can't load mod_spatialite):
+PYTHON=python3.12 ./dev/setup.sh
+PYTHON=$(which python) ./dev/setup.sh        # if a conda env is active
+PYTHON=/opt/homebrew/bin/python3.12 ./dev/setup.sh
 ```
 
 What it does:
 
 1. `brew install libspatialite ngrok` (idempotent)
-2. Creates `.venv/` at the repo root
-3. `pip install -r requirements.txt` into the venv
-4. Creates `dev/data/` for the local DB file
-5. Prompts you to configure `ngrok` with your authtoken if you haven't already
+2. Validates that `$PYTHON` can load sqlite extensions — fails fast with
+   install hints if not
+3. Creates `.venv/` at the repo root using the validated interpreter
+4. `pip install -r requirements.txt` into the venv
+5. Creates `dev/data/` for the local DB file
 
-Re-running is safe — every step is idempotent.
+If you previously ran `./dev/setup.sh` with the wrong Python, just re-run it
+with `PYTHON=...` set — the script detects an extension-incompatible venv and
+rebuilds it.
+
+Re-running is otherwise safe — every step is idempotent.
 
 ## Daily workflow
 

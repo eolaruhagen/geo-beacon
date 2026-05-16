@@ -28,7 +28,7 @@ fi
 
 # Helpful early error rather than a confusing uvicorn import trace.
 MODULE_FILE="${APP_MODULE%%:*}"
-MODULE_FILE="${MODULE_FILE//./\/}.py"
+MODULE_FILE="${MODULE_FILE//.//}.py"
 if [[ ! -f "$MODULE_FILE" ]]; then
   fail "$MODULE_FILE doesn't exist — nobody has scaffolded the FastAPI app yet."
   echo "  Override the module via APP_MODULE if it lives somewhere else." >&2
