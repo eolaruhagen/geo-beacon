@@ -175,6 +175,80 @@ def hazards_for_mission(mission_id: int) -> list[dict]: ...
 def delete_hazards_for_mission(mission_id: int) -> int: ...
 ```
 
+### `api/db/dispatches.py`
+
+```python
+ACTIVE_STATUSES = ("pending", "acked", "in_progress")
+
+def get_dispatch(dispatch_id: int) -> dict | None: ...
+def active_dispatch_for_user(user_id: int) -> dict | None:
+    """Most-recently-issued row for the user with status in ACTIVE_STATUSES.
+    ORDER BY issued_ts DESC LIMIT 1."""
+
+def transition_status(
+    dispatch_id: int,
+    new_status: str,
+    ts_field: str | None = None,   # 'acked_ts' | 'started_ts' | 'completed_ts'
+    completion_notes: str | None = None,
+) -> None:
+    """Unconditional write; caller validates the previous status."""
+
+def segment_feature_for_dispatch(dispatch: dict) -> dict | None:
+    """The dispatch's segment as a GeoJSON Feature with properties matching
+    the segment rows in /mission/state.geojson. None for recall (segment_id
+    NULL) or if the segment row was deleted."""
+```
+
+### `api/db/broadcasts.py`
+
+```python
+# Visibility policy lives here, NOT in the route layer. See module
+# docstring + the "Broadcasts visibility policy" section above.
+
+def visible_broadcasts_for_user(
+    user_id: int,
+    mission_id: int,
+    since_ts: int | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Returns rows newest-first where
+    mission_id = ? AND (scope = 'all' OR scope = f'user:{user_id}')
+    AND (ts > since_ts if provided)."""
+
+def insert_broadcast(
+    mission_id: int, scope: str, kind: str, message: str, ts: int | None = None,
+) -> int: ...
+
+def user_scope(user_id: int) -> str:
+    """Builds 'user:{id}'. Always use this when writing — never hand-format."""
+```
+
+### `api/db/routing.py`
+
+```python
+def snap_point_to_nearest_trail(
+    mission_id: int, lat: float, lon: float,
+) -> tuple[float, float] | None:
+    """Closest point on any osm_features row with kind='trail', returned as
+    (lat, lon). None if the mission has no trails. Uses SpatiaLite
+    ClosestPoint + Distance ordering. No graph routing — snap only."""
+```
+
+### `api/db/users.py` additions
+
+```python
+def set_user_status(user_id: int, status: str) -> None:
+    """UPDATE users SET status = ?. CHECK constraint enforces allowed values
+    (standby/dispatched/on_segment/returning/no_comms/off_duty)."""
+```
+
+### `api/db/pings.py` additions
+
+```python
+def latest_ping_for_user(user_id: int, mission_id: int) -> dict | None:
+    """Most recent ping for (user, mission), or None. ORDER BY ts DESC LIMIT 1."""
+```
+
 ### `api/db/geojson.py` (extend, keep existing layers)
 
 ```python
@@ -316,6 +390,57 @@ Pydantic v2 for all bodies. Validators: lat in [-90,90], lon in [-180,180],
 confidence in [0,1], role in {searcher, observer}, hazard kind/severity per
 the migration CHECK constraints.
 
+`Literal` aliases mirror DB CHECK constraints — keep them in sync if a
+migration changes the allowed values:
+
+| Alias              | Allowed values                                                                              | Migration ref                          |
+| ------------------ | ------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `FindingKind`      | clue, subject_found, subject_sighting, hazard, footprint, discarded_item, note, other        | `002_spatial.sql:74`                   |
+| `HazardKind`       | cliff, water, weather, no_comms_zone, wildlife, other                                       | `002_spatial.sql:97`                   |
+| `HazardSeverity`   | info, caution, critical                                                                     | `002_spatial.sql:98`                   |
+| `UserRole`         | searcher, observer                                                                          | `001_init.sql:19`                      |
+| `DispatchStatus`   | pending, acked, in_progress, completed, cancelled, superseded                               | `001_init.sql:59`                      |
+| `SweepType`        | hasty, efficient, thorough                                                                  | `001_init.sql:54`                      |
+| `BroadcastKind`    | info, warning, recall, finding_alert, route_correction                                      | `001_init.sql:73`                      |
+
+Notable models for the searcher app:
+
+- **`UserPublic`** — safe-to-expose user projection. Excludes `bearer_token`
+  and `phone`. Used in `MeResponse.user`.
+- **`MeResponse`** — `{user, mission_id, active_dispatch, segment_geojson,
+  nearby_hazards, recent_broadcasts}`. `recent_broadcasts` is capped to the
+  most recent 5 per the scope-policy filter (see below).
+- **`ActiveDispatch`** — full dispatches row projected as a Pydantic model.
+  Returned inline by `/field/me` when status ∈ {pending, acked, in_progress}.
+- **`DispatchCompleteRequest`** — `{notes?: str (≤2000)}`.
+- **`DispatchActionResponse`** — `{dispatch_id, status, user_status}`.
+- **`RouteWaypoint` / `RouteResponse`** — `{waypoints: [{lat,lon}, …], snapped: bool}`.
+  `snapped=false` is the fallback bee-line when no trail features exist.
+- **`Broadcast`** — `{id, scope, kind, message, ts}`. Scope is always either
+  `'all'` or `f'user:{caller_id}'` — see policy below.
+- **`AnnouncementsResponse`** — `{broadcasts: [Broadcast], cursor_ts: int}`.
+  `cursor_ts` is the newest `ts` in the batch (or echo of the `since`
+  parameter if empty), used as the next watermark.
+
+### Broadcasts visibility policy (RLS-like, enforced in `api/db/broadcasts.py`)
+
+`broadcasts.scope` is either `'all'` (mission-wide) or `f'user:{user_id}'`
+(targeted). SQLite has no row-level-security primitive, so the filter lives
+in `api/db/broadcasts.visible_broadcasts_for_user`:
+
+```sql
+WHERE mission_id = ?
+  AND (scope = 'all' OR scope = 'user:{caller.id}')
+```
+
+**Every route that returns broadcasts MUST go through this helper** —
+direct `SELECT ... FROM broadcasts ...` in a route handler would skip the
+policy. Both surfaces that read broadcasts (`/field/me`'s
+`recent_broadcasts` and `/field/announcements`) use the helper.
+
+If a new scope keyword is introduced (e.g. `'team:{id}'`), update the
+helper's WHERE clause and this section in the same change.
+
 ### `api/routes/missions.py` (replaces `admin.py`)
 
 ```python
@@ -352,11 +477,33 @@ POST /missions/join
 
 ### `api/routes/field.py`
 
-- `POST /field/ping` — auth via bearer, mission_id resolved via
-  `active_mission_id_for_user(user.id)`. Same as before.
-- `GET /field/me` — same stub for now; `nearby_hazards` query is a follow-up.
-- `POST /field/findings` — new: accepts `{lat, lon, kind, description, confidence}`
-  OR `{hex_id, ...}`. Server resolves the other. Sets `hex_cells.flag_clue=1`.
+All endpoints require `x-bearer-token` header (NOT `Authorization: Bearer`).
+Auth resolved via `api.auth.current_user` → users row by `bearer_token`.
+Mission resolved via `active_mission_id_for_user` (reads
+`users.current_mission_id`). Calls with no current mission return **409**.
+
+| Method | Path                              | Body                                          | Returns / behavior                                                                                                                                                                                                                          |
+| ------ | --------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/field/ping`                     | `PingRequest`                                 | → 200 `{ping_id}`. Appends to `pings`. Sets `geom = MakePoint(lon, lat, 4326)`.                                                                                                                                                              |
+| POST   | `/field/findings`                 | `FindingRequest`                              | → 201 `{finding_id, hex_id}`. Accepts either `(lat, lon)` or `hex_id`; server resolves the other. Sets `hex_cells.flag_clue=1`. If `kind=='hazard'`, also inserts a hex-shaped `hazards` row (`kind='other'`, `severity='caution'`) and rasterizes `flag_danger`. |
+| GET    | `/field/me`                       | —                                             | → 200 `MeResponse`. Polled ~5s. Inline payload: active dispatch (status pending/acked/in_progress) + its segment as a GeoJSON Feature + last 5 visible broadcasts (scope-filtered).                                                          |
+| POST   | `/field/dispatch/{id}/ack`        | —                                             | → 200 `DispatchActionResponse`. Strict transition: dispatch must be `pending`. Else 409. User auth: must own the dispatch (403 otherwise). 404 on unknown id. Sets `acked_ts`.                                                                |
+| POST   | `/field/dispatch/{id}/start`      | —                                             | → 200. Must be `acked`. Sets `started_ts`. `user.status` → `on_segment`.                                                                                                                                                                     |
+| POST   | `/field/dispatch/{id}/complete`   | `DispatchCompleteRequest` (`{notes?}` ≤ 2000) | → 200. Must be `in_progress`. Sets `completed_ts` and `completion_notes`. `user.status` → `standby`.                                                                                                                                          |
+| GET    | `/field/me/route?segment_id=X`    | —                                             | → 200 `RouteResponse`. Snap-to-trail waypoints from `start = latest_ping or PLS` to `target = active_dispatch.entry_lat/lon (if matches) or segment.centroid`. 4 waypoints when trails exist (start, snap_in, snap_out, target); 2-point bee-line otherwise (`snapped=false`). 404 on unknown segment for this mission. |
+| GET    | `/field/announcements?since={ts}` | —                                             | → 200 `AnnouncementsResponse`. All scope-visible broadcasts with `ts > since`, newest-first. `cursor_ts` is the newest `ts` in the batch (or echo of `since` if empty) — store and re-poll with `?since=cursor_ts`.                          |
+
+Dispatch state machine (strictly enforced by `_apply_dispatch_action`):
+
+```
+pending ─ack─► acked ─start─► in_progress ─complete─► completed
+                                                        │
+                                                        └── /field/me drops it from active_dispatch
+```
+
+Any out-of-order action returns **409** with the exact required status in
+the detail string. Cross-user calls return **403** (without leaking the
+actual owner). Unknown id returns **404**.
 
 ### `api/routes/mission.py`
 

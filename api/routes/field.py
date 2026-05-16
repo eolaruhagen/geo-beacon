@@ -18,6 +18,8 @@ from api.db.hex_cells import (
 )
 from api.schemas import (
     ActiveDispatch,
+    AnnouncementsResponse,
+    Broadcast,
     DispatchActionResponse,
     DispatchCompleteRequest,
     FindingRequest,
@@ -29,11 +31,18 @@ from api.schemas import (
     RouteWaypoint,
     UserPublic,
 )
+import api.db.broadcasts as db_broadcasts
 import api.db.dispatches as db_dispatches
 import api.db.missions as db_missions
 import api.db.pings as db_pings
 import api.db.users as db_users
 from api.db.routing import snap_point_to_nearest_trail
+
+
+# Cap on inline broadcasts surfaced by GET /field/me. The full history is
+# available via /field/announcements with watermark pagination, so this only
+# needs to cover "what banner should the app show right now" — last few alerts.
+ME_BROADCASTS_LIMIT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +84,45 @@ async def field_me(user: dict = Depends(current_user)) -> MeResponse:
         active_model = ActiveDispatch.model_validate(active)
         seg_feature = db_dispatches.segment_feature_for_dispatch(active)
 
+    # Visibility filter (scope='all' OR scope='user:{id}') is enforced inside
+    # db_broadcasts.visible_broadcasts_for_user — see the module docstring.
+    recent: list[Broadcast] = []
+    if mission_id is not None:
+        rows = db_broadcasts.visible_broadcasts_for_user(
+            user_id=user["id"], mission_id=mission_id, limit=ME_BROADCASTS_LIMIT,
+        )
+        recent = [Broadcast.model_validate(r) for r in rows]
+
     return MeResponse(
         user=UserPublic.model_validate(user),
         mission_id=mission_id,
         active_dispatch=active_model,
         segment_geojson=seg_feature,
+        recent_broadcasts=recent,
     )
+
+
+@router.get("/announcements", response_model=AnnouncementsResponse)
+async def field_announcements(
+    since: int = Query(0, ge=0, description="Unix-epoch seconds; returns broadcasts with ts > since"),
+    user: dict = Depends(current_user),
+) -> AnnouncementsResponse:
+    """Watermark-paginated broadcasts visible to this user.
+
+    Visibility policy is enforced in db_broadcasts (scope='all' OR
+    scope=f'user:{user.id}'). The app stores the returned `cursor_ts` and
+    re-polls with `?since=cursor_ts` for incremental delivery.
+    """
+    mission_id = db_missions.active_mission_id_for_user(user["id"])
+    if mission_id is None:
+        raise HTTPException(status_code=409, detail="No active mission for this user")
+
+    rows = db_broadcasts.visible_broadcasts_for_user(
+        user_id=user["id"], mission_id=mission_id, since_ts=since,
+    )
+    broadcasts = [Broadcast.model_validate(r) for r in rows]
+    cursor = max((b.ts for b in broadcasts), default=since)
+    return AnnouncementsResponse(broadcasts=broadcasts, cursor_ts=cursor)
 
 
 # Allowed state transitions: keys are required current statuses, values are

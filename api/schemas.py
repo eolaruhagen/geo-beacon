@@ -34,6 +34,10 @@ DispatchStatus = Literal[
 
 SweepType = Literal["hasty", "efficient", "thorough"]  # migrations/001_init.sql:54
 
+BroadcastKind = Literal[
+    "info", "warning", "recall", "finding_alert", "route_correction"
+]  # migrations/001_init.sql:73 (broadcasts.kind CHECK)
+
 
 class HazardInput(BaseModel):
     # H-2: hazards.geom is registered as POLYGON (singular) in
@@ -177,6 +181,29 @@ class DispatchActionResponse(BaseModel):
     user_status: str
 
 
+class Broadcast(BaseModel):
+    """Single broadcast row, already filtered through the visibility policy
+    in api/db/broadcasts.py (scope is 'all' or 'user:{caller_id}')."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    scope: str
+    kind: BroadcastKind
+    message: str
+    ts: int
+
+
+class AnnouncementsResponse(BaseModel):
+    """Return shape for GET /field/announcements?since=ts.
+
+    `cursor_ts` is the latest broadcast `ts` in this batch (or echo of
+    `since` if empty). The app stores this and re-polls with
+    `?since=cursor_ts` for incremental delivery.
+    """
+    broadcasts: List[Broadcast]
+    cursor_ts: int
+
+
 class RouteWaypoint(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
@@ -204,4 +231,7 @@ class MeResponse(BaseModel):
     # or the dispatch is a recall (segment_id NULL).
     segment_geojson: Optional[dict[str, Any]] = None
     nearby_hazards: List = Field(default_factory=list)
-    recent_broadcasts: List = Field(default_factory=list)
+    # Already scope-filtered via api/db/broadcasts.visible_broadcasts_for_user.
+    # Capped to the most recent few so the 5s poll stays cheap; full history
+    # lives behind GET /field/announcements?since=ts.
+    recent_broadcasts: List[Broadcast] = Field(default_factory=list)
