@@ -4,25 +4,24 @@
 -- Addresses:
 --   U-1: users.callsign was globally UNIQUE; spec implies per-mission scope.
 --        Add users.current_mission_id and replace global UNIQUE(callsign)
---        with UNIQUE(current_mission_id, callsign). The single-mission
---        scope per spec §2 means we never have two simultaneous missions in
---        practice, but the constraint matches the intent.
---   F-2: findings.description was NOT NULL but most clue / hex-tap finds carry
---        no narrative text — phone keyboard taps with a kind enum should be
---        legal. Make it nullable.
+--        with UNIQUE(current_mission_id, callsign).
+--   F-2: findings.description was NOT NULL — phone hex-taps without a narrative
+--        should be legal. Make it nullable.
 --
--- SQLite can't ALTER an existing column's constraints, so both `users` and
--- `findings` are rebuilt via the rename-and-copy pattern. `findings.geom` is
--- handled via DiscardGeometryColumn / AddGeometryColumn around the rebuild so
--- SpatiaLite's metadata stays consistent.
---
--- Foreign keys are toggled OFF for the rebuild so the temporary table-name
--- shuffle doesn't trip the references from pings, dispatches, findings, etc.
+-- DEV-SETUP ASSUMPTION: data in `users` and `findings` is throwaway, so this
+-- migration simply DROPs and recreates both tables instead of doing the
+-- rename-and-copy dance. If you ever ship a real deployment, write a proper
+-- 005 that backfills first. Foreign keys are toggled OFF for the duration so
+-- the references from pings/dispatches/findings to users don't trip during
+-- the drop. `findings.geom` is unregistered before drop and re-registered
+-- after recreate so SpatiaLite metadata stays consistent.
 
 PRAGMA foreign_keys = OFF;
 
--- ----- users rebuild -----
-CREATE TABLE users_new (
+-- ----- users -----
+DROP TABLE users;
+
+CREATE TABLE users (
   id                  INTEGER PRIMARY KEY,
   display_name        TEXT    NOT NULL,
   callsign            TEXT,
@@ -35,20 +34,13 @@ CREATE TABLE users_new (
   UNIQUE (current_mission_id, callsign)
 );
 
-INSERT INTO users_new (id, display_name, callsign, phone, role, status, bearer_token, current_mission_id, created_ts)
-  SELECT id, display_name, callsign, phone, role, status, bearer_token, NULL, created_ts FROM users;
-
-DROP TABLE users;
-ALTER TABLE users_new RENAME TO users;
-
 CREATE INDEX idx_users_mission ON users (current_mission_id);
 
--- ----- findings rebuild -----
+-- ----- findings -----
 SELECT DiscardGeometryColumn('findings', 'geom');
-DROP INDEX IF EXISTS idx_findings_mission_ts;
-DROP INDEX IF EXISTS idx_findings_hex;
+DROP TABLE findings;
 
-CREATE TABLE findings_new (
+CREATE TABLE findings (
   id                INTEGER PRIMARY KEY,
   mission_id        INTEGER NOT NULL REFERENCES missions(id),
   reporter_user_id  INTEGER NOT NULL REFERENCES users(id),
@@ -61,12 +53,6 @@ CREATE TABLE findings_new (
   confidence        REAL    NOT NULL,
   photo_url         TEXT
 );
-
-INSERT INTO findings_new (id, mission_id, reporter_user_id, hex_id, ts, lat, lon, kind, description, confidence, photo_url)
-  SELECT id, mission_id, reporter_user_id, hex_id, ts, lat, lon, kind, description, confidence, photo_url FROM findings;
-
-DROP TABLE findings;
-ALTER TABLE findings_new RENAME TO findings;
 
 SELECT AddGeometryColumn('findings', 'geom', 4326, 'POINT', 'XY', 1);
 SELECT CreateSpatialIndex('findings', 'geom');
