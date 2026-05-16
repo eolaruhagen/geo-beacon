@@ -11,8 +11,10 @@ venv/
 *.db
 *.db-wal
 *.db-shm
-/data/             # repo-root data dir if anyone uses it
-dev/data/*         # local dev DB files, but keep the dir tracked
+# repo-root data dir if anyone uses it
+/data/
+# local dev DB files, but keep the dir tracked
+dev/data/*
 !dev/data/.gitkeep
 logs/
 

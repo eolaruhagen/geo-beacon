@@ -1,0 +1,25 @@
+# Example OpenClaw/Nemoclaw config notes for geo-beacon.
+#
+# Copy this to your local OpenClaw config location on the DGX and adapt the
+# exact key names to the OpenClaw version you install. Keep the real local config
+# out of git if it contains API keys, hostnames, or personal paths.
+
+[runtime]
+repo_root = "/home/asus/geo-beacon"
+prompt_file = "/home/asus/geo-beacon/openclaw/agent_prompt.md"
+
+[model]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "nemotron"
+
+[environment]
+MISSION_DB_PATH = "/home/asus/sqlite/mission.db"
+# SPATIALITE_PATH = "/usr/lib/aarch64-linux-gnu/mod_spatialite.so"
+
+[[mcp_servers]]
+name = "geo-beacon-sar"
+command = "/home/asus/geo-beacon/.venv/bin/python"
+args = ["-m", "agent.mcp_server"]
+cwd = "/home/asus/geo-beacon"
+

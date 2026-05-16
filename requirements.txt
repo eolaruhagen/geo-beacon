@@ -12,3 +12,6 @@ shapely==2.*
 rasterio==1.4.*
 numpy==2.*
 requests==2.32.*           # Overpass API + raster downloads
+
+# MCP bridge for OpenClaw tool access
+mcp==1.*
