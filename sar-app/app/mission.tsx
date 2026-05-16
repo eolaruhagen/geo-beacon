@@ -2,7 +2,7 @@ import { router } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import MapView, { Marker, Polygon, Polyline, type Region } from 'react-native-maps';
+import MapView, { Callout, Marker, Polygon, Polyline, UrlTile, type Region } from 'react-native-maps';
 
 import FindingSheet from './components/FindingSheet';
 import MissionHud from './components/MissionHud';
@@ -261,6 +261,9 @@ export default function MissionView() {
           flag_searched: p.flag_searched,
           is_water: p.is_water,
           is_building: p.is_building,
+          // Attribution: who marked this cell searched. Drives the per-user
+          // coverage tint in fillFor() below.
+          searched_by_user_id: p.searched_by_user_id,
         });
       }
     }
@@ -338,6 +341,7 @@ export default function MissionView() {
     }
   }, [mission, segments, me?.active_dispatch, debugBusy, refreshMe]);
 
+  const selfUserId = mission?.user_id ?? null;
   const polygons = useMemo(() => {
     if (!grid) return null;
     return grid.features.map((f) => {
@@ -354,11 +358,11 @@ export default function MissionView() {
           }))}
           strokeColor="rgba(0,0,0,0.28)"
           strokeWidth={0.5}
-          fillColor={fillFor(effective)}
+          fillColor={fillFor(effective, selfUserId)}
         />
       );
     });
-  }, [grid, liveHexFlags]);
+  }, [grid, liveHexFlags, selfUserId]);
 
   const trackLines = useMemo(() => {
     if (tracks.length === 0) return null;
@@ -408,18 +412,42 @@ export default function MissionView() {
     return findings.map((f, i) => {
       const [lon, lat] = f.geometry.coordinates;
       const color = FINDING_COLORS[f.properties.kind] ?? FINDING_COLORS.other;
+      const { kind, description, confidence, ts } = f.properties;
       return (
         <Marker
           // Server doesn't currently include finding.id in properties — fall
           // back to ts+index. Findings can't be edited/deleted from the UI so
           // identity stability across polls is good-enough.
-          key={`finding-${f.properties.ts}-${i}`}
+          key={`finding-${ts}-${i}`}
           coordinate={{ latitude: lat, longitude: lon }}
           anchor={{ x: 0.5, y: 1 }}
         >
           <View style={[s.findingPin, { backgroundColor: color }]}>
-            <Text style={s.findingPinGlyph}>{glyphFor(f.properties.kind)}</Text>
+            <Text style={s.findingPinGlyph}>{glyphFor(kind)}</Text>
           </View>
+          {/* Native callout — tap the pin to see a quick preview. The
+              tooltip="true" + no native callout container gives us a
+              custom-styled bubble instead of the default speech-bubble. */}
+          <Callout tooltip>
+            <View style={s.findingCallout}>
+              <View style={s.findingCalloutRow}>
+                <View style={[s.findingCalloutSwatch, { backgroundColor: color }]}>
+                  <Text style={s.findingCalloutSwatchGlyph}>{glyphFor(kind)}</Text>
+                </View>
+                <Text style={s.findingCalloutKind}>{kind.replace('_', ' ')}</Text>
+              </View>
+              {description ? (
+                <Text style={s.findingCalloutDesc} numberOfLines={4}>
+                  {description}
+                </Text>
+              ) : (
+                <Text style={s.findingCalloutDescMuted}>No description.</Text>
+              )}
+              <Text style={s.findingCalloutMeta}>
+                {`Confidence ${Math.round(confidence * 100)}% · ${formatTime(ts)}`}
+              </Text>
+            </View>
+          </Callout>
         </Marker>
       );
     });
@@ -467,21 +495,42 @@ export default function MissionView() {
 
   const segmentOutlines = useMemo(() => {
     if (segments.length === 0) return null;
-    return segments.map((seg) => (
-      <Polygon
-        key={`segment-outline-${seg.properties.id}`}
-        coordinates={seg.geometry.coordinates[0].map(([lon, lat]) => ({
-          latitude: lat,
-          longitude: lon,
-        }))}
-        strokeColor={SEGMENT_STATUS_COLOR[seg.properties.status]}
-        strokeWidth={1.5}
-        // Defensive: "transparent" works on most react-native-maps versions but
-        // some older builds fall back to translucent red for non-rgba inputs.
-        fillColor="rgba(0,0,0,0)"
-      />
-    ));
-  }, [segments]);
+    return segments.map((seg) => {
+      const { status, assigned_user_id: uid } = seg.properties;
+      // Color attribution: assigned/in_progress segments take the assignee's
+      // palette color (or self color), so two dispatches to different
+      // searchers visually separate. Unassigned/completed segments fall
+      // back to the status-only color — completed coverage is signaled
+      // by the per-cell hex tints below.
+      const assigneeColor = uid != null
+        ? (uid === selfUserId ? SELF_TRACK_COLOR : colorForUser(uid))
+        : null;
+      const showsAssignee = (status === 'assigned' || status === 'in_progress')
+        && assigneeColor != null;
+      const strokeColor = showsAssignee
+        ? assigneeColor!
+        : SEGMENT_STATUS_COLOR[status];
+      // in_progress = bold solid; assigned = thinner dashed so the searcher
+      // can distinguish "I have it" from "I'm actively on it".
+      const strokeWidth = status === 'in_progress' ? 2.5 : 1.5;
+      const dashed = status === 'assigned';
+      return (
+        <Polygon
+          key={`segment-outline-${seg.properties.id}`}
+          coordinates={seg.geometry.coordinates[0].map(([lon, lat]) => ({
+            latitude: lat,
+            longitude: lon,
+          }))}
+          strokeColor={strokeColor}
+          strokeWidth={strokeWidth}
+          lineDashPattern={dashed ? [8, 4] : undefined}
+          // Defensive: "transparent" works on most react-native-maps versions but
+          // some older builds fall back to translucent red for non-rgba inputs.
+          fillColor="rgba(0,0,0,0)"
+        />
+      );
+    });
+  }, [segments, selfUserId]);
 
   // Snap-to-trail route from the searcher's last ping to the active
   // dispatch's segment entry, fetched on-demand by MissionHud and forwarded
@@ -557,11 +606,24 @@ export default function MissionView() {
         showsCompass={false}
         initialRegion={initialRegion ?? undefined}
         onRegionChangeComplete={setRegion}
-        // iOS-only neutral basemap. Desaturates Apple's bright greens / blues
-        // so the hex grid and findings can carry the visual signal instead
-        // of competing with the terrain layer.
-        mapType="mutedStandard"
+        // mapType="none" hides Apple's default tiles; the UrlTile below
+        // paints CartoDB Positron in their place — a near-grayscale
+        // basemap designed specifically for data overlays. The hex grid
+        // and finding pins become the primary visual signal instead of
+        // fighting Apple's saturated greens / waters.
+        mapType="none"
+        showsPointsOfInterest={false}
+        showsBuildings={false}
+        showsTraffic={false}
       >
+        <UrlTile
+          // CartoDB Positron — light, neutral, no POI/road labels at low
+          // zoom. Free for non-commercial use (cdn-backed; attribution
+          // shown on the legend below). {s} cycles a/b/c subdomains.
+          urlTemplate="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+          maximumZ={19}
+          flipY={false}
+        />
         {polygons}
         {trailLines}
         {hazardPolygons}
@@ -670,19 +732,49 @@ export default function MissionView() {
   );
 }
 
-function fillFor(p: HexProps): string {
+function fillFor(p: HexProps, selfUserId: number | null): string {
   // Priority order: safety flags > human-raised signals > coverage > base
-  // terrain. flag_searched (mockup blue) sits above terrain because a phone
-  // walking through a "water" cell means either OSM is wrong or there's a
+  // terrain. flag_searched sits above terrain because a phone walking
+  // through a "water" cell means either OSM is wrong or there's a
   // bridge — the foot is fresher info than the seed-time classification.
   if (p.flag_impassable) return 'rgba(40,40,40,0.22)';
   if (p.flag_danger) return 'rgba(214,54,47,0.20)';
   if (p.flag_clue) return 'rgba(240,200,60,0.26)';
   if (p.flag_poi) return 'rgba(140,90,200,0.22)';
-  if (p.flag_searched) return 'rgba(43,108,246,0.18)';  // .cell-searched, wireframes-v2.css:225
+  if (p.flag_searched) {
+    // Coverage attribution: tint by the searcher who marked the cell.
+    // Self gets the SELF_TRACK_COLOR (blue) so the searcher's own
+    // coverage reads consistently with their track line. Others get
+    // their palette color from colorForUser, alpha-matched.
+    const uid = p.searched_by_user_id;
+    if (uid != null && selfUserId != null && uid === selfUserId) {
+      return rgbaWithAlpha(SELF_TRACK_COLOR, 0.22);
+    }
+    if (uid != null) {
+      return rgbaWithAlpha(colorForUser(uid), 0.22);
+    }
+    // Searched but no attribution recorded (legacy rows): fall back to
+    // the old neutral blue so coverage is still visible.
+    return 'rgba(43,108,246,0.18)';
+  }
   if (p.is_water) return 'rgba(80,150,220,0.20)';
   if (p.is_building) return 'rgba(120,120,120,0.22)';
   return 'rgba(0,0,0,0.04)';
+}
+
+/** Turn a hex color like "#2f80ed" into an rgba(...) string with the given
+ *  alpha. Used to apply translucent tints derived from the per-user palette
+ *  without authoring a parallel alpha-color table. */
+function rgbaWithAlpha(hex: string, alpha: number): string {
+  // Strip leading '#'. Supports 3- or 6-digit hex.
+  const v = hex.replace('#', '');
+  const full = v.length === 3
+    ? v.split('').map((ch) => ch + ch).join('')
+    : v;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
 }
 
 function regionFromGrid(g: HexGrid): Region | null {
@@ -775,6 +867,18 @@ const SEGMENT_STATUS_COLOR: Record<SegmentStatus, string> = {
 
 function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
+}
+
+/** Compact "x min ago" / "Hh:Mm" formatter for the finding-callout meta line.
+ *  Falls back to a clock time once an event is over an hour old so the
+ *  preview doesn't grow to "184 min ago". */
+function formatTime(unixSec: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const delta = now - unixSec;
+  if (delta < 60) return 'just now';
+  if (delta < 3600) return `${Math.floor(delta / 60)} min ago`;
+  const d = new Date(unixSec * 1000);
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 function polygonCentroid(ring: number[][]): { latitude: number; longitude: number } {
@@ -1040,6 +1144,42 @@ const s = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
     lineHeight: 14,
+  },
+
+  // Tooltip-mode callout — react-native-maps renders this as a floating
+  // bubble above the pin when tapped. Custom-styled (white card, rounded)
+  // since the default Apple Maps callout is iOS-only and visually
+  // mismatched with the rest of the app.
+  findingCallout: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    minWidth: 180,
+    maxWidth: 240,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    gap: 4,
+  },
+  findingCalloutRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  findingCalloutSwatch: {
+    width: 18, height: 18, borderRadius: 9,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  findingCalloutSwatchGlyph: { color: '#fff', fontSize: 10, fontWeight: '700' },
+  findingCalloutKind: {
+    fontSize: 13, fontWeight: '700', color: '#0b0b0c',
+    textTransform: 'capitalize',
+  },
+  findingCalloutDesc: { fontSize: 12, color: '#0b0b0c', lineHeight: 16 },
+  findingCalloutDescMuted: {
+    fontSize: 12, color: '#6b6b73', fontStyle: 'italic',
+  },
+  findingCalloutMeta: {
+    fontSize: 10, color: '#6b6b73', marginTop: 2,
+    fontVariant: ['tabular-nums'],
   },
 
   // Text-only segment labels. White text + dark halo via textShadow so they

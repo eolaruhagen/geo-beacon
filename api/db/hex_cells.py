@@ -123,3 +123,31 @@ def mark_hex_searched(hex_id: int, user_id: int, ts: int) -> None:
             """,
             (user_id, ts, hex_id),
         )
+
+
+def mark_segment_searched(
+    mission_id: int, segment_id: int, user_id: int, ts: int,
+) -> int:
+    """Mark every hex cell in `segment_id` as searched by `user_id`.
+
+    Called from POST /field/dispatch/{id}/complete: when a searcher closes
+    out a dispatch the system treats the whole segment as covered.
+    Existing flag_searched=1 cells get their searched_by_user_id /
+    searched_ts overwritten (last-writer-wins, same as the per-ping path);
+    if you'd rather preserve attribution per cell, gate this on
+    `flag_searched = 0` in the WHERE clause.
+
+    Returns the count of cells touched.
+    """
+    with session() as conn:
+        cur = conn.execute(
+            """
+            UPDATE hex_cells
+            SET flag_searched = 1,
+                searched_by_user_id = ?,
+                searched_ts = ?
+            WHERE mission_id = ? AND segment_id = ?
+            """,
+            (user_id, ts, mission_id, segment_id),
+        )
+        return cur.rowcount or 0
