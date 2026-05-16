@@ -152,6 +152,37 @@ def mission_state_feature_collection(mission_id: int) -> dict:
                 },
             })
 
+        # Dispatch targets: the containing hex_cell of each currently-active
+        # dispatch, attributed to its assignee. Emitted as a dedicated feature
+        # type so the client can render a per-user hex highlight without
+        # touching segment-level attribution (which the cell-grain router
+        # never sets). One feature per active dispatch.
+        dispatch_target_rows = conn.execute(
+            """
+            SELECT d.id AS dispatch_id, d.user_id, d.status,
+                   h.id AS hex_id, AsGeoJSON(h.geom) AS geom_json
+            FROM dispatches d
+            JOIN hex_cells h ON h.mission_id = d.mission_id
+                            AND ST_Contains(h.geom, MakePoint(d.entry_lon, d.entry_lat, 4326))
+            WHERE d.mission_id = ?
+              AND d.status IN ('pending', 'acked', 'in_progress')
+            """,
+            (mission_id,),
+        ).fetchall()
+        for row in dispatch_target_rows:
+            geom = json.loads(row["geom_json"]) if row["geom_json"] else None
+            features.append({
+                "type": "Feature",
+                "geometry": geom,
+                "properties": {
+                    "feature_type": "dispatch_target",
+                    "dispatch_id": row["dispatch_id"],
+                    "user_id": row["user_id"],
+                    "status": row["status"],
+                    "hex_id": row["hex_id"],
+                },
+            })
+
         # Hazards: Polygon Features
         hazard_rows = conn.execute(
             """

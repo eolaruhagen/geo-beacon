@@ -20,6 +20,7 @@ import { useRoute } from './lib/useRoute';
 import {
   fetchHexGrid,
   useMissionState,
+  type DispatchTargetFeature,
   type FindingFeature,
   type FindingKind,
   type HazardFeature,
@@ -494,21 +495,39 @@ export default function MissionView() {
     );
   }, [routeWaypoints]);
 
-  const dispatchTargetMarker = useMemo(() => {
-    const ad = me?.active_dispatch;
-    if (!ad || ad.entry_lat == null || ad.entry_lon == null) return null;
-    return (
-      <Marker
-        key={`dispatch-target-${ad.id}`}
-        coordinate={{ latitude: ad.entry_lat, longitude: ad.entry_lon }}
-        anchor={{ x: 0.5, y: 0.5 }}
-      >
-        <View style={s.dispatchTargetOuter}>
-          <View style={s.dispatchTargetInner} />
-        </View>
-      </Marker>
+  // Active dispatches surfaced as their containing hex_cell — server-side
+  // join in api/db/geojson.py runs ST_Contains so we can render the hex
+  // shape directly. Visible to every searcher in the mission, colored by
+  // assignee so two simultaneous dispatches read as distinct.
+  const dispatchTargetHexes = useMemo(() => {
+    if (!missionState) return null;
+    const targets = missionState.features.filter(
+      (f): f is DispatchTargetFeature => f.properties.feature_type === 'dispatch_target',
     );
-  }, [me?.active_dispatch]);
+    if (targets.length === 0) return null;
+    return targets.map((dt) => {
+      const uid = dt.properties.user_id;
+      const isSelf = uid === selfUserId;
+      const baseColor = isSelf ? SELF_TRACK_COLOR : colorForUser(uid);
+      // in_progress = bold solid; pending/acked = thinner dashed so the
+      // map distinguishes "I have it" from "I'm actively on it" the same
+      // way the legacy segment outline did.
+      const inProgress = dt.properties.status === 'in_progress';
+      return (
+        <Polygon
+          key={`dispatch-target-${dt.properties.dispatch_id}`}
+          coordinates={dt.geometry.coordinates[0].map(([lon, lat]) => ({
+            latitude: lat,
+            longitude: lon,
+          }))}
+          strokeColor={baseColor}
+          strokeWidth={inProgress ? 3 : 2}
+          lineDashPattern={inProgress ? undefined : [8, 4]}
+          fillColor={rgbaWithAlpha(baseColor, 0.18)}
+        />
+      );
+    });
+  }, [missionState, selfUserId]);
 
   const segmentLabels = useMemo(() => {
     if (segments.length === 0 || !region) return null;
@@ -593,8 +612,8 @@ export default function MissionView() {
         {segmentOutlines}
         {segmentLabels}
         {trackLines}
+        {dispatchTargetHexes}
         {routePolyline}
-        {dispatchTargetMarker}
         {searcherMarkers}
         {findingPins}
       </MapView>
@@ -1106,27 +1125,6 @@ const s = StyleSheet.create({
     fontSize: 10,
     fontWeight: '600',
     fontVariant: ['tabular-nums'],
-  },
-
-  dispatchTargetOuter: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 2,
-    borderColor: '#fff',
-    backgroundColor: 'rgba(17,24,39,0.88)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-  },
-  dispatchTargetInner: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#ffd166',
   },
 
   // .mapctrl from wireframes-v2.css:254 — top-right floating control stack.
