@@ -1,15 +1,15 @@
 -- Base non-spatial tables.
 -- Spatial tables (pings, segments, findings, hazards) live in 002.
 -- Hex grid + OSM cache (hex_cells, hex_visits, osm_features) live in 003.
--- Agent journal lives in 004.
 --
 -- Auth model: per-user bearer_token generated at join time. Mission creator is the
 -- admin via missions.created_by_user_id; no separate admin role. Mission has a
 -- shareable join_code so other searchers (and observers) can opt in from the app.
 --
--- Agent invocation model: no queue. agent_worker polls on a tick, comparing
--- missions.last_agent_invocation_ts against events. force_agent_invoke=1 lets a
--- handler short-circuit the next tick (used for subject_found + commander_override).
+-- Agent invocation model: cron-driven. workers/agent.py is invoked on a fixed
+-- schedule (e.g. every 60s), reads recent events from the relevant tables to
+-- compose a brief, invokes nemoclaw, and exits. Agent memory / reasoning history
+-- lives in nemoclaw's own memory files on disk, not in the database.
 
 CREATE TABLE users (
   id            INTEGER PRIMARY KEY,
@@ -33,9 +33,7 @@ CREATE TABLE missions (
   join_code                TEXT    NOT NULL UNIQUE,                -- short shareable string
   created_by_user_id       INTEGER NOT NULL REFERENCES users(id),  -- mission creator = admin
   started_ts               INTEGER NOT NULL,
-  ended_ts                 INTEGER,
-  last_agent_invocation_ts INTEGER NOT NULL DEFAULT 0,             -- agent_worker high-watermark
-  force_agent_invoke       INTEGER NOT NULL DEFAULT 0              -- 1 = next tick must invoke
+  ended_ts                 INTEGER
   -- area_geom POLYGON added in 002 via AddGeometryColumn
 );
 
