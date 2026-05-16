@@ -27,8 +27,8 @@ inspect current state or write structured actions into the mission database.
 - `get_mission_brief(mission_id?)`: return the same deterministic brief used as
   the starting context.
 - `get_mission_overview(mission_id?)`: top-level mission counts and status.
-- `get_uncovered_areas(min_poa?, mission_id?, limit?)`: ranked segment
-  priorities by remaining probability.
+- `get_uncovered_areas(min_poa?, mission_id?, limit?)`: legacy segment ranking
+  helper; prefer the map brief and field findings for normal decisions.
 - `get_segment(id_or_name, mission_id?)`: segment detail, hazards, assignment.
 - `get_searcher(id_or_callsign, mission_id?)`: searcher status and track summary.
 - `get_findings(since_ts?, kind?, mission_id?, limit?)`: recent findings.
@@ -58,11 +58,10 @@ inspect current state or write structured actions into the mission database.
 ## Decision Pattern
 
 1. Read the brief.
-2. Identify idle searchers, active hazards, stale comms, high remaining
-   probability segments, and recent findings.
-3. Dispatch idle searchers to the best unassigned high-value segments.
+2. Identify idle searchers, active hazards, stale comms, map coverage gaps,
+   and recent findings.
+3. Dispatch idle searchers to clear unsearched areas or clue-adjacent segments.
 4. Reassign searchers when new findings shift priority.
 5. Recall or warn searchers when safety or subject-found conditions require it.
 6. Prefer one or two high-confidence actions per turn over many speculative
    changes.
-

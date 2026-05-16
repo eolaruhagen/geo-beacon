@@ -71,7 +71,7 @@ CREATE TABLE findings (
   ts                INTEGER NOT NULL,
   lat               REAL    NOT NULL,
   lon               REAL    NOT NULL,
-  kind              TEXT    NOT NULL CHECK (kind IN ('clue', 'subject_found', 'subject_sighting', 'hazard', 'footprint', 'discarded_item', 'note', 'other')),
+  kind              TEXT    NOT NULL CHECK (kind IN ('clue', 'subject_found', 'subject_sighting', 'hazard', 'footprint', 'discarded_item')),
   description       TEXT,    -- nullable: phone hex-taps with a kind enum and no narrative are legal
   confidence        REAL    NOT NULL,
   photo_url         TEXT    -- deferred for hack; column present so we don't migrate later

@@ -14,8 +14,6 @@ FindingKind = Literal[
     "hazard",
     "footprint",
     "discarded_item",
-    "note",
-    "other",
 ]  # migrations/002_spatial.sql:74 (findings.kind CHECK)
 
 HazardKind = Literal[

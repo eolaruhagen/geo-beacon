@@ -295,7 +295,7 @@ def get_segment(id_or_name: int | str, mission_id: int | None = None) -> dict[st
     return result
 
 
-# Gets clues, sightings, hazards, and notes that searchers reported.
+# Gets clues, sightings, hazards, footprints, and dropped items that searchers reported.
 # The agent can filter by time or kind when it only wants recent important items.
 def get_findings(
     since_ts: int | None = None,

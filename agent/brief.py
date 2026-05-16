@@ -6,7 +6,6 @@ import time
 from agent.skills.read import (
     get_findings,
     get_mission_overview,
-    get_uncovered_areas,
     list_searchers,
 )
 from api.db import session
@@ -26,14 +25,6 @@ def _age_min(ts: int | None, now: int) -> str:
     if ts is None:
         return "unknown"
     return f"{max(0, int((now - ts) / 60))} min"
-
-
-# Turns a decimal like 0.42 into a friendly percent.
-# The brief uses this so humans and the agent can scan values quickly.
-def _pct(value: float | int | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value) * 100:.0f}%"
 
 
 # Finds hazards that are still active for this mission.
@@ -96,7 +87,11 @@ def _recent_actions(mission_id: int, since_ts: int) -> list[dict]:
 
 # Builds the markdown mission brief for the agent.
 # It is the clean "story so far" before OpenClaw decides what tools to call.
-def compose_brief(mission_id: int | None = None, now_ts: int | None = None) -> str:
+def compose_brief(
+    mission_id: int | None = None,
+    now_ts: int | None = None,
+    ascii_map: str | None = None,
+) -> str:
     """Build deterministic markdown context for an OpenClaw invocation."""
     now = now_ts or int(time.time())
     overview = get_mission_overview(mission_id)
@@ -117,27 +112,19 @@ def compose_brief(mission_id: int | None = None, now_ts: int | None = None) -> s
     lines.append(
         f"- Active searchers: {overview['active_searchers']}/{overview['total_searchers']}"
     )
-    lines.append(f"- Cumulative POS: {_pct(overview['cumulative_pos'])}")
 
     lines.append("")
     lines.append("## Coverage Summary")
     lines.append(
         f"- Segments swept/cleared: {overview['swept_segments']}/{overview['total_segments']}"
     )
-    uncovered = get_uncovered_areas(mission_id=mid, limit=6)
-    if uncovered:
-        lines.append("- Highest remaining probability segments:")
-        for seg in uncovered:
-            assigned = f", assigned={seg['assigned_callsign']}" if seg["assigned_callsign"] else ""
-            hazards = ", hazards" if seg["hazard_count"] else ""
-            lines.append(
-                f"  - {seg['name']} (POA={_pct(seg['poa'])}, POD={_pct(seg['pod'])}, "
-                f"remaining={_pct(seg['remaining_probability'])}, "
-                f"{seg['dominant_cover']}, slope={seg['avg_slope_deg']:.1f}deg"
-                f"{assigned}{hazards})"
-            )
-    else:
-        lines.append("- No uncovered segment rows available.")
+
+    if ascii_map:
+        lines.append("")
+        lines.append("## Current Map")
+        lines.append("```text")
+        lines.append(ascii_map.strip())
+        lines.append("```")
 
     searchers = list_searchers(mid)
     if searchers:
@@ -151,8 +138,7 @@ def compose_brief(mission_id: int | None = None, now_ts: int | None = None) -> s
             if dispatch:
                 assignment = (
                     f"on {dispatch['segment_name']} status={dispatch['status']}, "
-                    f"sweep={dispatch['sweep_type']}, POD={_pct(dispatch['segment_pod'])}/"
-                    f"{_pct(dispatch['segment_target_pod'])}"
+                    f"sweep={dispatch['sweep_type']}"
                 )
             else:
                 assignment = "no active dispatch"
@@ -166,8 +152,7 @@ def compose_brief(mission_id: int | None = None, now_ts: int | None = None) -> s
             desc = f["description"] or ""
             segment = f["segment_name"] or f"hex {f['hex_id']}"
             lines.append(
-                f"- {_fmt_ts(f['ts'])} by {f['reporter_callsign']}: "
-                f"{f['kind']} conf={f['confidence']:.1f} at {segment}: {desc!r}"
+                f"- {_fmt_ts(f['ts'])}: {f['kind']} at {segment}: {desc!r}"
             )
 
     hazards = _active_hazards(mid)
@@ -204,8 +189,6 @@ def compose_brief(mission_id: int | None = None, now_ts: int | None = None) -> s
             stale.append(s["callsign"] or s["display_name"])
     if stale:
         lines.append(f"- No recent comms from: {', '.join(stale)}")
-    if not uncovered:
-        lines.append("- No segment priority data is available; inspect mission setup.")
-    lines.append("- Decide whether to dispatch idle searchers, reassign low-value searches, or broadcast safety updates.")
+    lines.append("- Decide whether to dispatch idle searchers, reassign active searches, recall teams, or broadcast safety updates.")
 
     return "\n".join(lines).strip() + "\n"

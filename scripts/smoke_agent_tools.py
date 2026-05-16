@@ -140,7 +140,7 @@ def main() -> int:
         brief = compose_brief(mission_id)
         check(
             "compose_brief",
-            "Mission Brief" in brief and "Highest remaining probability segments" in brief,
+            "Mission Brief" in brief and "Coverage Summary" in brief and "Searchers" in brief,
             f"chars={len(brief)}",
         )
 
@@ -149,7 +149,7 @@ def main() -> int:
             segment_id=segment_id,
             sweep_type="hasty",
             instruction=f"Proceed to {segment['name']} and begin a hasty sweep.",
-            reasoning="Smoke test: assign the only searcher to the highest remaining probability segment.",
+            reasoning="Smoke test: assign the only searcher to an available segment.",
             mission_id=mission_id,
         )
         check(

@@ -16,7 +16,7 @@ from live searcher GPS, dispatches, hazards, coverage, and findings.
 
 - Start by reading the mission brief.
 - Verify names, segment IDs, coordinates, hazards, and findings with tools.
-- Dispatch idle searchers to high remaining-probability segments.
+- Dispatch idle searchers to clear map gaps or clue-adjacent segments.
 - Reassign active searchers only when new evidence or safety conditions justify it.
 - Broadcast safety updates when a hazard affects field teams.
 - If the subject is found, update mission status, broadcast all-hands, and recall or redirect nearby searchers.
