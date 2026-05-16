@@ -88,18 +88,26 @@ def set_status(mission_id: int, status: str) -> None:
 
 
 def active_mission_id_for_user(user_id: int) -> int | None:
-    """Returns mission_id of the most recent mission this user is associated with.
+    """Returns mission_id of the mission this user is currently associated with.
 
-    Lookup order:
-      1. mission this user created (created_by_user_id match)
-      2. most recent mission this user has pinged into
-      3. fallback: the single mission with status='active', if exactly one
-         exists. Matches the single-active-mission scope per spec §2 — when a
-         user joins via /missions/join, no row physically associates them
-         with the mission until they ping, so this fallback lets that first
-         ping land.
+    Lookup order (migration 004 added users.current_mission_id, which is the
+    authoritative source now):
+      1. users.current_mission_id direct read — set when the user creates or
+         joins a mission.
+      2. Defensive fallback: mission this user created (created_by_user_id)
+         OR most recent mission this user has pinged into. Kept around in case
+         a legacy row has current_mission_id NULL.
+      3. Final fallback: the single mission with status='active', if exactly
+         one exists. Matches the single-active-mission scope per spec §2.
     """
     with session() as conn:
+        row = conn.execute(
+            "SELECT current_mission_id FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is not None and row["current_mission_id"] is not None:
+            return row["current_mission_id"]
+
         row = conn.execute(
             """
             SELECT id FROM missions
