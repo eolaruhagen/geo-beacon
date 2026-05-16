@@ -16,6 +16,12 @@ dev/data/*         # local dev DB files, but keep the dir tracked
 !dev/data/.gitkeep
 logs/
 
+# Repo root has no Node package — sar-app/ owns the only one. Block stray
+# package.json / node_modules created by an `npx` run from the wrong cwd.
+/node_modules/
+/package.json
+/package-lock.json
+
 # Editor / OS
 .DS_Store
 .idea/

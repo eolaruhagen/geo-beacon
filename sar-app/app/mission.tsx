@@ -1,13 +1,21 @@
 import { router } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapView, { Marker, Polygon, Polyline, type Region } from 'react-native-maps';
 
 import FindingSheet from './components/FindingSheet';
 import MissionHud from './components/MissionHud';
-import type { RouteWaypoint } from './lib/api';
+import {
+  ackDispatch,
+  completeDispatch,
+  postDebugDispatch,
+  startDispatch,
+  type RouteWaypoint,
+} from './lib/api';
 import { startTracking, stopTracking } from './lib/location';
+import { useMe } from './lib/useMe';
+import { useRoute } from './lib/useRoute';
 import {
   fetchHexGrid,
   useMissionState,
@@ -36,6 +44,51 @@ export default function MissionView() {
   // Starts null and is hydrated from initialRegion once the grid loads, so
   // labels can show on first paint without waiting for the user to pan.
   const [region, setRegion] = useState<Region | null>(null);
+
+  // ─── HUD state (lifted from MissionHud so the top-right button stack and
+  //     the panels share one source of truth). ───────────────────────────
+  const [broadcastForceOpen, setBroadcastForceOpen] = useState(false);
+  const [ordersForceOpen, setOrdersForceOpen] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [debugBusy, setDebugBusy] = useState(false);
+
+  const insets = useSafeAreaInsets();
+
+  // Personal state poll (/field/me). Driver for the dispatch + broadcast UI.
+  const { data: me, refresh: refreshMe } = useMe(
+    mission?.server_url ?? null,
+    mission?.bearer_token ?? null,
+  );
+
+  // Snap-to-trail route. Fetched when the active dispatch is acked or
+  // in_progress so the user sees the suggested path to the segment entry.
+  const { data: routeData, fetch: fetchRoute } = useRoute(
+    mission?.server_url ?? null,
+    mission?.bearer_token ?? null,
+  );
+
+  // Auto-trigger /field/me/route on dispatch-status transitions.
+  const lastRouteKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const ad = me?.active_dispatch ?? null;
+    const wantsRoute =
+      ad != null &&
+      ad.segment_id != null &&
+      (ad.status === 'acked' || ad.status === 'in_progress');
+    const key = wantsRoute ? `${ad!.id}:${ad!.status}` : null;
+    if (key === lastRouteKeyRef.current) return;
+    lastRouteKeyRef.current = key;
+    if (wantsRoute) {
+      void fetchRoute(ad!.segment_id!);
+    } else {
+      void fetchRoute(null);
+    }
+  }, [me?.active_dispatch, fetchRoute]);
+
+  // Forward route waypoints to the map (rendered as a Polyline).
+  useEffect(() => {
+    setRouteWaypoints(routeData?.waypoints ?? null);
+  }, [routeData]);
 
   const loadHexGrid = useCallback(async () => {
     if (!mission) return;
@@ -92,6 +145,54 @@ export default function MissionView() {
     if (!mission?.mission_id) return;
     void loadHexGrid();
   }, [mission?.mission_id, loadHexGrid]);
+
+  // Wrapper: run a dispatch lifecycle action, then refresh /field/me so the
+  // CurrentOrdersCard updates without waiting for the next 5s poll tick.
+  const runDispatchAction = useCallback(
+    async (action: () => Promise<unknown>) => {
+      if (!mission) return;
+      setActionBusy(true);
+      try {
+        await action();
+        await refreshMe();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : 'Action failed';
+        Alert.alert('Dispatch error', msg);
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [mission, refreshMe],
+  );
+
+  const onAck = useCallback(() => {
+    const ad = me?.active_dispatch;
+    if (!ad || !mission) return;
+    void runDispatchAction(() => ackDispatch(mission.server_url, mission.bearer_token, ad.id));
+  }, [me?.active_dispatch, mission, runDispatchAction]);
+
+  const onStart = useCallback(() => {
+    const ad = me?.active_dispatch;
+    if (!ad || !mission) return;
+    void runDispatchAction(() => startDispatch(mission.server_url, mission.bearer_token, ad.id));
+  }, [me?.active_dispatch, mission, runDispatchAction]);
+
+  const onComplete = useCallback(
+    (notes?: string) => {
+      const ad = me?.active_dispatch;
+      if (!ad || !mission) return;
+      void runDispatchAction(() =>
+        completeDispatch(mission.server_url, mission.bearer_token, ad.id, notes),
+      );
+    },
+    [me?.active_dispatch, mission, runDispatchAction],
+  );
+
+  // DEV: trigger /debug/dispatch against the highest-POA *unassigned* segment.
+  // This is what the real agent will do too (modulo POD/POS weighting), so
+  // it's also a sanity check on the POA math. Defined inside the component
+  // so it can read `segments` from the missionState closure below.
+  // (Function body lives after the segments memo — see onDebugDispatch.)
 
   const missionState = useMissionState(
     mission?.server_url ?? null,
@@ -198,6 +299,44 @@ export default function MissionView() {
     await clear(Keys.CurrentMission);
     router.replace('/');
   }
+
+  // DEV: dispatch the caller to the highest-POA unassigned segment in the
+  // current mission. Mirrors what the real agent's dispatch_searcher skill
+  // will eventually choose. Calls POST /debug/dispatch and then refreshes
+  // /field/me so the orders card appears immediately.
+  const onDebugDispatch = useCallback(async () => {
+    if (!mission || debugBusy) return;
+    if (me?.active_dispatch) {
+      Alert.alert('Already dispatched', 'Complete or cancel the current dispatch first.');
+      return;
+    }
+    // Pick highest-POA segment with no current assignee.
+    const candidate = [...segments]
+      .filter((s) => s.properties.assigned_user_id == null)
+      .sort((a, b) => b.properties.poa - a.properties.poa)[0];
+    if (!candidate) {
+      Alert.alert('No segments available', 'All segments already have an assignee.');
+      return;
+    }
+    setDebugBusy(true);
+    try {
+      const resp = await postDebugDispatch(mission.server_url, mission.bearer_token, {
+        segment_id: candidate.properties.id,
+        instruction: `Sweep ${candidate.properties.name} (highest POA)`,
+      });
+      await refreshMe();
+      Alert.alert(
+        'Dispatched',
+        `Sent you to ${candidate.properties.name} ` +
+          `(POA ${(candidate.properties.poa * 100).toFixed(1)}%). Dispatch #${resp.id}.`,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Debug dispatch failed';
+      Alert.alert('Dispatch failed', msg);
+    } finally {
+      setDebugBusy(false);
+    }
+  }, [mission, segments, me?.active_dispatch, debugBusy, refreshMe]);
 
   const polygons = useMemo(() => {
     if (!grid) return null;
@@ -418,6 +557,10 @@ export default function MissionView() {
         showsCompass={false}
         initialRegion={initialRegion ?? undefined}
         onRegionChangeComplete={setRegion}
+        // iOS-only neutral basemap. Desaturates Apple's bright greens / blues
+        // so the hex grid and findings can carry the visual signal instead
+        // of competing with the terrain layer.
+        mapType="mutedStandard"
       >
         {polygons}
         {trailLines}
@@ -431,9 +574,16 @@ export default function MissionView() {
       </MapView>
 
       <MissionHud
-        serverUrl={mission?.server_url ?? null}
-        bearerToken={mission?.bearer_token ?? null}
-        onRouteChange={setRouteWaypoints}
+        me={me}
+        broadcastForceOpen={broadcastForceOpen}
+        ordersForceOpen={ordersForceOpen}
+        closeBroadcastManual={() => setBroadcastForceOpen(false)}
+        closeOrdersManual={() => setOrdersForceOpen(false)}
+        onAck={onAck}
+        onStart={onStart}
+        onComplete={onComplete}
+        actionBusy={actionBusy}
+        topOffsetPx={insets.top + 60}
       />
 
       <SafeAreaView style={s.topInset} pointerEvents="box-none">
@@ -458,15 +608,35 @@ export default function MissionView() {
             </Text>
           </View>
 
+          {/* All top-right action buttons live in one column so they don't
+              fight the title pill for layout. Order: bell, clipboard, dev
+              dispatch, finding. The bell/clipboard buttons toggle the
+              banner / orders card open even when there's no data, which
+              lets you sanity-check that polling is working. */}
           <View style={s.mapctrl}>
-            <Pressable
-              style={({ pressed }) => [s.mapctrlBtn, pressed && s.mapctrlBtnPressed]}
+            <ActionButton
+              glyph="🔔"
+              dot={(me?.recent_broadcasts.length ?? 0) > 0}
+              onPress={() => setBroadcastForceOpen((v) => !v)}
+              a11y="Toggle broadcasts"
+            />
+            <ActionButton
+              glyph="📋"
+              dot={me?.active_dispatch != null}
+              onPress={() => setOrdersForceOpen((v) => !v)}
+              a11y="Toggle current orders"
+            />
+            <ActionButton
+              glyph={debugBusy ? '…' : '🎯'}
+              onPress={onDebugDispatch}
+              a11y="Dispatch me (dev)"
+              disabled={debugBusy}
+            />
+            <ActionButton
+              glyph="🚩"
               onPress={() => setSheetOpen(true)}
-              hitSlop={4}
-              accessibilityLabel="Log finding"
-            >
-              <Text style={s.mapctrlGlyph}>🚩</Text>
-            </Pressable>
+              a11y="Log finding"
+            />
           </View>
         </View>
       </SafeAreaView>
@@ -478,7 +648,7 @@ export default function MissionView() {
         <Text style={s.fabIcon}>💬</Text>
       </Pressable>
 
-      <MapLegend />
+      <MapLegend topOffsetPx={insets.top + 60} />
 
       {mission && (
         <FindingSheet
@@ -621,12 +791,38 @@ function polygonCentroid(ring: number[][]): { latitude: number; longitude: numbe
   return { latitude: sLat / pts.length, longitude: sLon / pts.length };
 }
 
-function MapLegend() {
+function ActionButton({
+  glyph, dot, onPress, a11y, disabled,
+}: {
+  glyph: string;
+  onPress: () => void;
+  a11y: string;
+  dot?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      style={({ pressed }) => [
+        s.mapctrlBtn,
+        (pressed || disabled) && s.mapctrlBtnPressed,
+      ]}
+      onPress={onPress}
+      hitSlop={4}
+      accessibilityLabel={a11y}
+      disabled={disabled}
+    >
+      <Text style={s.mapctrlGlyph}>{glyph}</Text>
+      {dot ? <View style={s.mapctrlDot} /> : null}
+    </Pressable>
+  );
+}
+
+function MapLegend({ topOffsetPx }: { topOffsetPx: number }) {
   // Top-left mini-legend, collapsed by default so it doesn't crowd the map
   // controls or the broadcast banner. Tap the header to expand.
   const [expanded, setExpanded] = useState(false);
   return (
-    <View style={s.legend}>
+    <View style={[s.legend, { top: topOffsetPx }]}>
       <Pressable
         onPress={() => setExpanded((v) => !v)}
         style={({ pressed }) => [s.legendHeader, pressed && s.legendHeaderPressed]}
@@ -790,7 +986,9 @@ const s = StyleSheet.create({
   },
 
   // .mapctrl from wireframes-v2.css:254 — top-right floating control stack.
-  // Single button here; future controls (compass, layers) stack vertically.
+  // Vertical column holding all top-right action buttons (broadcasts,
+  // orders, dev dispatch, finding). Single rounded container so the
+  // visual weight matches the title pill on the left.
   mapctrl: {
     width: 44,
     borderRadius: 12,
@@ -809,8 +1007,19 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  mapctrlBtnPressed: { opacity: 0.65 },
+  mapctrlBtnPressed: { opacity: 0.55 },
   mapctrlGlyph: { fontSize: 18 },
+  mapctrlDot: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    backgroundColor: '#d6362f',
+    borderWidth: 1,
+    borderColor: '#fff',
+  },
 
   findingPin: {
     minWidth: 22,
@@ -857,11 +1066,11 @@ const s = StyleSheet.create({
   },
 
   // Top-left mini-legend. Collapsed by default — only the header pill shows
-  // until the user taps to expand. Sits below the title pill (top ≈ 70)
-  // and above the FindingSheet's bottom area.
+  // until the user taps to expand. `top` is set inline from
+  // useSafeAreaInsets so the legend tucks below the title pill on any
+  // device (notched / non-notched / flat).
   legend: {
     position: 'absolute',
-    top: 70,
     left: 12,
     width: 130,
     borderRadius: 12,

@@ -20,6 +20,9 @@ type Props = {
   forceOpen: boolean;
   /** Parent closes the manual-open mode. */
   onCloseManual: () => void;
+  /** Vertical offset where the banner should start, in px. Computed by the
+   *  parent from useSafeAreaInsets so the banner tucks below the title pill. */
+  topOffsetPx: number;
 };
 
 const KIND_COLOR: Record<BroadcastKind, string> = {
@@ -30,7 +33,7 @@ const KIND_COLOR: Record<BroadcastKind, string> = {
   route_correction: '#d4a017',
 };
 
-export default function BroadcastBanner({ broadcasts, forceOpen, onCloseManual }: Props) {
+export default function BroadcastBanner({ broadcasts, forceOpen, onCloseManual, topOffsetPx }: Props) {
   // Latest dismissed broadcast ts — anything newer than this auto-shows.
   // Stored locally; persistence across reloads is a follow-up if needed.
   const [dismissedTs, setDismissedTs] = useState<number>(0);
@@ -41,7 +44,7 @@ export default function BroadcastBanner({ broadcasts, forceOpen, onCloseManual }
   if (!forceOpen && !hasNew) return null;
 
   return (
-    <View style={s.wrap} pointerEvents="box-none">
+    <View style={[s.wrap, { top: topOffsetPx }]} pointerEvents="box-none">
       {forceOpen && broadcasts.length === 0 ? (
         <View style={[s.banner, { borderLeftColor: '#9ca3af' }]}>
           <View style={s.content}>
@@ -94,9 +97,11 @@ export default function BroadcastBanner({ broadcasts, forceOpen, onCloseManual }
 const s = StyleSheet.create({
   wrap: {
     position: 'absolute',
-    top: 70,
+    // top is set inline from props (useSafeAreaInsets-derived).
+    // right: 64 keeps the banner from sliding under the top-right action
+    // stack (≈44px wide + 12px right margin) — both can be visible at once.
     left: 12,
-    right: 12,
+    right: 64,
     zIndex: 10,
   },
   list: {
