@@ -9,7 +9,7 @@ from api.db import session
 def create_user(
     display_name: str,
     callsign: str | None,
-    role: str,
+    role: str = "searcher",
 ) -> dict:
     """Inserts user with status='standby', random hex bearer_token (32 bytes).
     Returns {id, display_name, callsign, role, status, bearer_token, created_ts}."""

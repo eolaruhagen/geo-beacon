@@ -5,12 +5,14 @@ import json
 from api.db import session
 
 
-def bulk_insert_segments(mission_id: int, rows: list[dict]) -> int:
-    """Insert all rows in one transaction. status='unassigned'. Returns count."""
+def bulk_insert_segments(mission_id: int, rows: list[dict]) -> list[int]:
+    """Insert all rows in one transaction. status='unassigned'.
+    Returns list of inserted ids in the same order as input rows."""
+    ids: list[int] = []
     with session() as conn:
         conn.execute("BEGIN")
         for row in rows:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO segments (mission_id, name, area_m2, poa, pod, pos,
                                       status, avg_slope_deg, dominant_cover,
@@ -29,8 +31,9 @@ def bulk_insert_segments(mission_id: int, rows: list[dict]) -> int:
                     json.dumps(row["poly_geojson"]),
                 ),
             )
+            ids.append(cur.lastrowid)
         conn.execute("COMMIT")
-        return len(rows)
+        return ids
 
 
 CRITICAL_POA_FACTOR = 0.0
@@ -97,7 +100,7 @@ def segments_for_mission(mission_id: int) -> list[dict]:
             """
             SELECT id, mission_id, name, area_m2, poa, pod, pos, status,
                    sweep_type, target_pod, avg_slope_deg, dominant_cover,
-                   trail_length_m, AsGeoJSON(geom) AS geom_geojson
+                   trail_length_m, assigned_user_id, AsGeoJSON(geom) AS geom_geojson
             FROM segments WHERE mission_id = ?
             """,
             (mission_id,),

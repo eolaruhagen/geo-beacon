@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-"""Subdivide a mission area into ~100 m grid segments and compute initial POA.
+"""Subdivide a mission area into ~100m grid segments and compute initial POA.
 
 Usage:
     python scripts/seed_segments.py --mission-id N [--verbose]
 
-Reads the mission area + pre-fetched terrain_cells + osm_features from the DB,
-subdivides the bbox into a ~100 m grid, spatial-joins terrain data for each cell,
-computes initial POA weights via agent.poa, then bulk-inserts into segments.
+Reads mission from DB, subdivides bbox into ~100m segments, aggregates terrain
+stats from hex_data passed in memory, computes POA, bulk-inserts segments.
 
-Idempotent: deletes existing segments for this mission before inserting.
+New signature: seed_segments(mission_id, hex_data) -> list[int]
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 import sys
 from pathlib import Path
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.db import session
 from api.db.missions import get_mission
-from api.db.terrain import osm_features_for_mission, terrain_cells_for_mission
 from api.db.segments import bulk_insert_segments
 from agent.poa import initial_poa_weights
 
@@ -32,7 +28,7 @@ log = logging.getLogger("seed_segments")
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers (no shapely required — pure Python for portability)
+# Geometry helpers
 # ---------------------------------------------------------------------------
 
 def _bbox_from_geojson(geojson: dict) -> tuple[float, float, float, float]:
@@ -62,100 +58,57 @@ def _cell_polygon_geojson(lat: float, lon: float, dlat: float, dlon: float) -> d
 
 
 def _approx_area_m2(dlat: float, dlon: float, lat: float) -> float:
-    """Area of a grid cell in m² using flat-earth approximation."""
     h = dlat * 111_320.0
     w = dlon * 111_320.0 * math.cos(math.radians(lat))
     return h * w
 
 
-def _cell_bbox(lat: float, lon: float, dlat: float, dlon: float) -> tuple[float, float, float, float]:
-    return lat - dlat / 2, lon - dlon / 2, lat + dlat / 2, lon + dlon / 2
-
-
-def _point_in_bbox(
-    pt_lat: float, pt_lon: float,
-    min_lat: float, min_lon: float, max_lat: float, max_lon: float,
-) -> bool:
-    return min_lat <= pt_lat <= max_lat and min_lon <= pt_lon <= max_lon
-
-
-def _linestring_length_m(coords: list[list[float]]) -> float:
-    """Rough great-circle length of a LineString in metres."""
-    R = 6_371_000.0
-    total = 0.0
-    for i in range(len(coords) - 1):
-        lon1, lat1 = coords[i]
-        lon2, lat2 = coords[i + 1]
-        dphi = math.radians(lat2 - lat1)
-        dlam = math.radians(lon2 - lon1)
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
-        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-        total += 2 * R * math.asin(math.sqrt(a))
-    return total
-
-
-def _clip_linestring_to_bbox(
-    coords: list[list[float]],
-    min_lat: float, min_lon: float, max_lat: float, max_lon: float,
-) -> list[list[float]]:
-    """Return only segments whose midpoint falls inside the bbox (fast approximation)."""
-    clipped = []
-    for i in range(len(coords) - 1):
-        lon1, lat1 = coords[i]
-        lon2, lat2 = coords[i + 1]
-        mid_lat = (lat1 + lat2) / 2
-        mid_lon = (lon1 + lon2) / 2
-        if _point_in_bbox(mid_lat, mid_lon, min_lat, min_lon, max_lat, max_lon):
-            if not clipped:
-                clipped.append(coords[i])
-            clipped.append(coords[i + 1])
-    return clipped
-
-
 # ---------------------------------------------------------------------------
-# Terrain cell index (spatial join via bbox overlap)
+# Hex data aggregation helpers
 # ---------------------------------------------------------------------------
 
-def _build_cell_index(
-    terrain_cells: list[dict],
+def _build_hex_index(
+    hex_data: list[dict],
 ) -> list[tuple[float, float, float, float, dict]]:
-    """Return list of (min_lat, min_lon, max_lat, max_lon, cell) for fast lookup."""
+    """Return (min_lat, min_lon, max_lat, max_lon, hex) for fast bbox lookup."""
     index = []
-    for cell in terrain_cells:
-        geojson = cell.get("geom_geojson") or cell.get("poly_geojson")
-        if geojson is None:
-            continue
-        coords = geojson["coordinates"][0]
+    for h in hex_data:
+        coords = h["poly_geojson"]["coordinates"][0]
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
-        index.append((min(lats), min(lons), max(lats), max(lons), cell))
+        index.append((min(lats), min(lons), max(lats), max(lons), h))
     return index
 
 
-def _find_overlapping_cells(
-    seg_min_lat: float, seg_min_lon: float, seg_max_lat: float, seg_max_lon: float,
-    cell_index: list[tuple[float, float, float, float, dict]],
+def _hexes_in_bbox(
+    seg_min_lat: float, seg_min_lon: float,
+    seg_max_lat: float, seg_max_lon: float,
+    hex_index: list[tuple[float, float, float, float, dict]],
 ) -> list[dict]:
     result = []
-    for c_min_lat, c_min_lon, c_max_lat, c_max_lon, cell in cell_index:
-        if c_max_lat < seg_min_lat or c_min_lat > seg_max_lat:
+    for h_min_lat, h_min_lon, h_max_lat, h_max_lon, h in hex_index:
+        if h_max_lat < seg_min_lat or h_min_lat > seg_max_lat:
             continue
-        if c_max_lon < seg_min_lon or c_min_lon > seg_max_lon:
+        if h_max_lon < seg_min_lon or h_min_lon > seg_max_lon:
             continue
-        result.append(cell)
+        result.append(h)
     return result
+
+
+def _mode(values: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return max(counts, key=lambda k: counts[k])
 
 
 # ---------------------------------------------------------------------------
 # Main seeding logic
 # ---------------------------------------------------------------------------
 
-def seed_segments(mission_id: int) -> int:
-    """Read mission + terrain from DB, subdivide, compute POA, bulk-insert segments.
-
-    Returns number of segments inserted.
-    """
+def seed_segments(mission_id: int, hex_data: list[dict]) -> list[int]:
+    """Subdivide mission area into ~100m segments, aggregate hex terrain stats,
+    compute POA, bulk-insert. Returns list of inserted segment ids."""
     mission = get_mission(mission_id)
     if mission is None:
         raise ValueError(f"Mission {mission_id} not found")
@@ -172,148 +125,111 @@ def seed_segments(mission_id: int) -> int:
     dlat, dlon = _deg_per_100m(mid_lat)
 
     log.info(
-        "Mission %d bbox lat=[%.5f,%.5f] lon=[%.5f,%.5f] dlat=%.6f dlon=%.6f",
-        mission_id, min_lat, max_lat, min_lon, max_lon, dlat, dlon,
+        "Mission %d bbox lat=[%.5f,%.5f] lon=[%.5f,%.5f]",
+        mission_id, min_lat, max_lat, min_lon, max_lon,
     )
 
     # Idempotent: remove existing segments before re-seeding.
     with session() as conn:
         conn.execute("DELETE FROM segments WHERE mission_id = ?", (mission_id,))
 
-    terrain_cells = terrain_cells_for_mission(mission_id)
-    osm_features = osm_features_for_mission(mission_id)
-    log.info("Loaded %d terrain_cells, %d osm_features", len(terrain_cells), len(osm_features))
+    hex_index = _build_hex_index(hex_data)
+    log.info("Loaded %d hex cells for aggregation", len(hex_data))
 
-    cell_index = _build_cell_index(terrain_cells)
-
-    # Separate trail linestrings for trail_length_m computation.
-    trail_coords_list: list[list[list[float]]] = []
-    for feat in osm_features:
-        if feat.get("kind") != "trail":
-            continue
-        geojson = feat.get("geom_geojson") or feat.get("geom")
-        if geojson is None:
-            continue
-        if geojson["type"] == "LineString":
-            trail_coords_list.append(geojson["coordinates"])
-
-    # Collect PLS elevation from terrain cells (find nearest cell to PLS).
-    pls_elev_m = 100.0  # fallback
-    if terrain_cells:
+    # Find PLS elevation from hex nearest to PLS
+    pls_elev_m = 100.0
+    if hex_data:
         best_dist = float("inf")
-        for cell in terrain_cells:
-            geojson = cell.get("geom_geojson") or cell.get("poly_geojson")
-            if geojson is None:
-                continue
-            coords = geojson["coordinates"][0]
-            lons = [c[0] for c in coords]
-            lats = [c[1] for c in coords]
-            c_lat = sum(lats) / len(lats)
-            c_lon = sum(lons) / len(lons)
-            d = math.sqrt((c_lat - pls_lat) ** 2 + (c_lon - pls_lon) ** 2)
+        for h in hex_data:
+            d = math.sqrt((h["center_lat"] - pls_lat) ** 2 + (h["center_lon"] - pls_lon) ** 2)
             if d < best_dist:
                 best_dist = d
-                pls_elev_m = cell.get("center_elev_m", 100.0)
+                pls_elev_m = h.get("center_elev_m", 100.0)
 
-    # Grid iteration.
-    cell_centers: list[tuple[float, float]] = []
-    cell_elev_m: list[float] = []
-    cell_cover: list[str] = []
-    cell_has_trail: list[bool] = []
-    cell_slope: list[float] = []
-    cell_trail_len: list[float] = []
-    cell_poly_geojsons: list[dict] = []
-    cell_area_m2: list[float] = []
+    # Per-segment accumulators
+    seg_centers: list[tuple[float, float]] = []
+    seg_elev_m: list[float] = []
+    seg_cover: list[str] = []
+    seg_has_trail: list[bool] = []
+    seg_slope: list[float] = []
+    seg_trail_len_m: list[float] = []
+    seg_poly_geojsons: list[dict] = []
+    seg_area_m2: list[float] = []
 
-    seg_idx = 0
     lat = min_lat + dlat / 2
     while lat < max_lat:
         lon = min_lon + dlon / 2
         while lon < max_lon:
-            seg_min_lat, seg_min_lon, seg_max_lat, seg_max_lon = _cell_bbox(lat, lon, dlat, dlon)
+            seg_min_lat = lat - dlat / 2
+            seg_max_lat = lat + dlat / 2
+            seg_min_lon = lon - dlon / 2
+            seg_max_lon = lon + dlon / 2
 
-            overlapping = _find_overlapping_cells(
-                seg_min_lat, seg_min_lon, seg_max_lat, seg_max_lon, cell_index
+            contained = _hexes_in_bbox(
+                seg_min_lat, seg_min_lon, seg_max_lat, seg_max_lon, hex_index
             )
 
-            # avg_slope_deg + dominant_cover from overlapping terrain cells.
-            if overlapping:
-                avg_slope = sum(c.get("avg_slope_deg", 0.0) for c in overlapping) / len(overlapping)
-                cover_counts: dict[str, int] = {}
-                for c in overlapping:
-                    cov = c.get("dominant_cover", "mixed")
-                    cover_counts[cov] = cover_counts.get(cov, 0) + 1
-                dominant_cover = max(cover_counts, key=lambda k: cover_counts[k])
-                avg_elev = sum(c.get("center_elev_m", 100.0) for c in overlapping) / len(overlapping)
+            if contained:
+                avg_slope = sum(h.get("slope_deg", 0.0) for h in contained) / len(contained)
+                dominant_cover = _mode([h.get("dominant_cover", "mixed") for h in contained])
+                avg_elev = sum(h.get("center_elev_m", 100.0) for h in contained) / len(contained)
+                # trail_length_m: count of hexes with has_trail * 30m cell size
+                trail_hex_count = sum(1 for h in contained if h.get("has_trail", False))
+                trail_length_m = trail_hex_count * 30.0
+                has_trail = trail_hex_count > 0
             else:
                 avg_slope = 0.0
                 dominant_cover = "mixed"
                 avg_elev = pls_elev_m
+                trail_length_m = 0.0
+                has_trail = False
 
-            # trail_length_m: sum clipped trail segments that pass through this cell.
-            trail_len = 0.0
-            for trail_coords in trail_coords_list:
-                clipped = _clip_linestring_to_bbox(
-                    trail_coords, seg_min_lat, seg_min_lon, seg_max_lat, seg_max_lon
-                )
-                if clipped:
-                    trail_len += _linestring_length_m(clipped)
+            seg_centers.append((lat, lon))
+            seg_elev_m.append(avg_elev)
+            seg_cover.append(dominant_cover)
+            seg_has_trail.append(has_trail)
+            seg_slope.append(avg_slope)
+            seg_trail_len_m.append(trail_length_m)
+            seg_poly_geojsons.append(_cell_polygon_geojson(lat, lon, dlat, dlon))
+            seg_area_m2.append(_approx_area_m2(dlat, dlon, lat))
 
-            has_trail = trail_len > 0.0
-
-            cell_centers.append((lat, lon))
-            cell_elev_m.append(avg_elev)
-            cell_cover.append(dominant_cover)
-            cell_has_trail.append(has_trail)
-            cell_slope.append(avg_slope)
-            cell_trail_len.append(trail_len)
-            cell_poly_geojsons.append(_cell_polygon_geojson(lat, lon, dlat, dlon))
-            cell_area_m2.append(_approx_area_m2(dlat, dlon, lat))
-
-            seg_idx += 1
             lon += dlon
         lat += dlat
 
-    n_segs = len(cell_centers)
+    n_segs = len(seg_centers)
     log.info("Grid has %d segments", n_segs)
 
     if n_segs == 0:
         log.warning("No segments generated — check mission area_geom")
-        return 0
+        return []
 
-    # Compute raw weights via agent.poa.
     raw_weights = initial_poa_weights(
-        cell_centers=cell_centers,
-        cell_elev_m=cell_elev_m,
-        cell_cover=cell_cover,
-        cell_has_trail=cell_has_trail,
+        cell_centers=seg_centers,
+        cell_elev_m=seg_elev_m,
+        cell_cover=seg_cover,
+        cell_has_trail=seg_has_trail,
         pls_lat=pls_lat,
         pls_lon=pls_lon,
         pls_elev_m=pls_elev_m,
     )
 
-    total_w = sum(raw_weights)
-    if total_w <= 0:
-        total_w = 1.0
+    total_w = sum(raw_weights) or 1.0
 
     rows: list[dict] = []
     for i in range(n_segs):
-        poa = raw_weights[i] / total_w
-        rows.append(
-            {
-                "name": f"S-{i + 1:03d}",
-                "poly_geojson": cell_poly_geojsons[i],
-                "area_m2": round(cell_area_m2[i], 1),
-                "poa": round(poa, 6),
-                "avg_slope_deg": round(cell_slope[i], 2),
-                "dominant_cover": cell_cover[i],
-                "trail_length_m": round(cell_trail_len[i], 1),
-            }
-        )
+        rows.append({
+            "name": f"S-{i + 1:03d}",
+            "poly_geojson": seg_poly_geojsons[i],
+            "area_m2": round(seg_area_m2[i], 1),
+            "poa": round(raw_weights[i] / total_w, 6),
+            "avg_slope_deg": round(seg_slope[i], 2),
+            "dominant_cover": seg_cover[i],
+            "trail_length_m": round(seg_trail_len_m[i], 1),
+        })
 
-    inserted = bulk_insert_segments(mission_id, rows)
-    log.info("Inserted %d segments for mission %d", inserted, mission_id)
-    return inserted
+    segment_ids = bulk_insert_segments(mission_id, rows)
+    log.info("Inserted %d segments for mission %d", len(segment_ids), mission_id)
+    return segment_ids
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +238,8 @@ def seed_segments(mission_id: int) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mission-id", type=int, required=True, help="DB mission ID")
-    p.add_argument("--verbose", action="store_true", help="Debug logging")
+    p.add_argument("--mission-id", type=int, required=True)
+    p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
 
@@ -335,13 +251,19 @@ def main() -> int:
     )
 
     print(f"[seed_segments] mission_id={args.mission_id}", flush=True)
+    print("[seed_segments] CLI mode: running with mock terrain data", flush=True)
     try:
-        n = seed_segments(args.mission_id)
+        import os
+        os.environ.setdefault("TERRAIN_MOCK", "1")
+        from scripts.fetch_terrain import fetch_terrain
+        result = fetch_terrain(args.mission_id, mock=True)
+        hex_data = result["hex_data"]
+        ids = seed_segments(args.mission_id, hex_data)
     except Exception as exc:
         print(f"[seed_segments] ERROR: {exc}", file=sys.stderr, flush=True)
         return 1
 
-    print(f"[seed_segments] done: {n} segments inserted", flush=True)
+    print(f"[seed_segments] done: {len(ids)} segments inserted", flush=True)
     return 0
 
 

@@ -29,11 +29,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from api.routes import admin, field, mission  # noqa: E402
+from api.routes import missions, field, mission, admin  # noqa: E402
 
-app.include_router(admin.router)
+app.include_router(missions.router)
 app.include_router(field.router)
 app.include_router(mission.router)
+app.include_router(admin.router)
 
 
 if __name__ == "__main__":

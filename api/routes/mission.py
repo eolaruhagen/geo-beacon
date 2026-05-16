@@ -19,7 +19,7 @@ async def mission_state(
     _user: dict = Depends(current_user),
 ) -> Response:
     if mission_id is None:
-        mission_id = db_missions.active_mission_id()
+        mission_id = db_missions.active_mission_id_for_user(_user["id"])
     if mission_id is None:
         raise HTTPException(status_code=404, detail="No active mission")
 

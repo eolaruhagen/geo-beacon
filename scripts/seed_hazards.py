@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Derive non-dynamic hazards from terrain + OSM at mission init.
+"""Derive structural hazards from OSM features + hex_cells at mission init.
 
-Sources (all at init time, not agent-driven):
-  - osm_features kind='water'    → hazards kind='water',  severity='critical'
-  - osm_features kind='road'     → hazards kind='other',  severity='caution' (buffered ~5m)
-  - osm_features kind='building' → hazards kind='other',  severity='caution' (buffered ~2m)
-  - terrain_cells avg_slope_deg ≥ CLIFF_SLOPE_DEG → hazards kind='cliff', severity='caution'
+Sources:
+  - osm_features kind='water'    → hazard kind='water',  severity='critical'
+  - osm_features kind='road'     → kind='other', 'caution', buffered 5m
+  - osm_features kind='building' → kind='other', 'caution', buffered 2m
+  - hex_cells.slope_deg >= 30    → kind='cliff', severity='caution'
 
-Idempotent: deletes existing hazards for the mission before inserting.
+After inserting hazards, rasterizes each to hex_cells.flag_danger.
+Also sets is_water=1 / is_building=1 on hex_cells inside water/building OSM polygons.
+
+Idempotent: deletes existing hazards and resets hex_cells flags before re-deriving.
 
 Usage:
     python scripts/seed_hazards.py --mission-id N [--verbose]
@@ -25,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.db import session
 from api.db.hazards import bulk_insert_hazards, delete_hazards_for_mission
+from api.db.hex_cells import rasterize_hazard_to_hex_flags
 
 log = logging.getLogger("seed_hazards")
 
@@ -33,9 +37,7 @@ ROAD_BUFFER_M = 5.0
 BUILDING_BUFFER_M = 2.0
 
 
-def _buffer_deg_for_meters(lat: float, meters: float) -> float:
-    """Approximate degrees for ST_Buffer at given latitude. Buffer is in degrees
-    because our geometries are EPSG:4326."""
+def _buffer_deg(lat: float, meters: float) -> float:
     deg_per_meter_lat = 1.0 / 111_320.0
     deg_per_meter_lon = 1.0 / (111_320.0 * max(0.1, math.cos(math.radians(lat))))
     return meters * (deg_per_meter_lat + deg_per_meter_lon) / 2
@@ -50,26 +52,47 @@ def _mission_centroid_lat(mission_id: int) -> float:
         return float(row["lat"]) if row and row["lat"] is not None else 37.0
 
 
-def seed_hazards(mission_id: int) -> dict[str, int]:
-    """Insert structural hazards for a mission.
+def _explode_to_polygons(geom: dict) -> list[dict]:
+    t = geom.get("type")
+    if t == "Polygon":
+        return [geom]
+    if t == "MultiPolygon":
+        return [{"type": "Polygon", "coordinates": part} for part in geom["coordinates"]]
+    return []
 
-    Returns a counts dict {water, road, building, cliff, total}."""
-    counts = {"water": 0, "road": 0, "building": 0, "cliff": 0}
+
+def seed_hazards(mission_id: int) -> dict[str, int]:
+    """Insert structural hazards, rasterize to hex_cells, set feature-type flags.
+
+    Returns counts {water, road, building, cliff, total_hazards,
+                    hexes_flagged_danger, hexes_flagged_water, hexes_flagged_building}.
+    """
+    counts = {
+        "water": 0, "road": 0, "building": 0, "cliff": 0,
+        "total_hazards": 0,
+        "hexes_flagged_danger": 0,
+        "hexes_flagged_water": 0,
+        "hexes_flagged_building": 0,
+    }
+
+    # Idempotent: clear existing hazards and reset hex flags for this mission
     delete_hazards_for_mission(mission_id)
+    with session() as conn:
+        conn.execute(
+            "UPDATE hex_cells SET flag_danger=0, is_water=0, is_building=0 WHERE mission_id=?",
+            (mission_id,),
+        )
 
     centroid_lat = _mission_centroid_lat(mission_id)
-    road_buf = _buffer_deg_for_meters(centroid_lat, ROAD_BUFFER_M)
-    bldg_buf = _buffer_deg_for_meters(centroid_lat, BUILDING_BUFFER_M)
+    road_buf = _buffer_deg(centroid_lat, ROAD_BUFFER_M)
+    bldg_buf = _buffer_deg(centroid_lat, BUILDING_BUFFER_M)
 
     rows: list[dict] = []
 
     with session() as conn:
-        # OSM water → critical water hazards (one row per polygon part)
+        # Water → critical hazards
         water_rows = conn.execute(
-            """
-            SELECT name, AsGeoJSON(geom) AS gj
-            FROM osm_features WHERE mission_id = ? AND kind = 'water'
-            """,
+            "SELECT name, AsGeoJSON(geom) AS gj FROM osm_features WHERE mission_id=? AND kind='water'",
             (mission_id,),
         ).fetchall()
         for w in water_rows:
@@ -85,12 +108,9 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
                 })
                 counts["water"] += 1
 
-        # OSM road → caution 'other' hazards (buffered to a polygon)
+        # Road → caution 'other' hazards (buffered)
         road_rows = conn.execute(
-            """
-            SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj
-            FROM osm_features WHERE mission_id = ? AND kind = 'road'
-            """,
+            "SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj FROM osm_features WHERE mission_id=? AND kind='road'",
             (road_buf, mission_id),
         ).fetchall()
         for r in road_rows:
@@ -106,12 +126,9 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
                 })
                 counts["road"] += 1
 
-        # OSM building → caution 'other' hazards (buffered slightly)
+        # Building → caution 'other' hazards (buffered)
         bldg_rows = conn.execute(
-            """
-            SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj
-            FROM osm_features WHERE mission_id = ? AND kind = 'building'
-            """,
+            "SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj FROM osm_features WHERE mission_id=? AND kind='building'",
             (bldg_buf, mission_id),
         ).fetchall()
         for b in bldg_rows:
@@ -127,13 +144,9 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
                 })
                 counts["building"] += 1
 
-        # Steep terrain → cliff hazards (per-cell)
+        # Steep hex_cells → cliff hazards (per cell, fall back to per-cell if component logic is hard)
         cliff_rows = conn.execute(
-            """
-            SELECT avg_slope_deg, AsGeoJSON(geom) AS gj
-            FROM terrain_cells
-            WHERE mission_id = ? AND avg_slope_deg >= ?
-            """,
+            "SELECT slope_deg, AsGeoJSON(geom) AS gj FROM hex_cells WHERE mission_id=? AND slope_deg >= ?",
             (mission_id, CLIFF_SLOPE_DEG),
         ).fetchall()
         for c in cliff_rows:
@@ -144,31 +157,73 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
                 rows.append({
                     "kind": "cliff",
                     "severity": "caution",
-                    "description": f"Steep terrain ({c['avg_slope_deg']:.0f}° slope) — fall risk",
+                    "description": f"Steep terrain ({c['slope_deg']:.0f}° slope) — fall risk",
                     "poly_geojson": poly,
                 })
                 counts["cliff"] += 1
 
-    inserted = bulk_insert_hazards(mission_id, rows) if rows else 0
-    counts["total"] = inserted
+    # Insert all hazard rows, get back their ids for rasterization
+    hazard_ids: list[int] = []
+    if rows:
+        hazard_ids = bulk_insert_hazards(mission_id, rows)
+
+    counts["total_hazards"] = len(hazard_ids)
+
+    # Rasterize each hazard → flag_danger on intersecting hex_cells
+    for h_id in hazard_ids:
+        n_flagged = rasterize_hazard_to_hex_flags(mission_id, h_id)
+        counts["hexes_flagged_danger"] += n_flagged
+
+    # Set is_water=1 on hex_cells inside water OSM polygons (feature-type flag, not hazard)
+    with session() as conn:
+        water_result = conn.execute(
+            """
+            UPDATE hex_cells
+            SET is_water = 1
+            WHERE mission_id = ?
+              AND EXISTS (
+                SELECT 1 FROM osm_features f
+                WHERE f.mission_id = hex_cells.mission_id
+                  AND f.kind = 'water'
+                  AND ST_Contains(f.geom, hex_cells.geom)
+              )
+            """,
+            (mission_id,),
+        )
+        counts["hexes_flagged_water"] = water_result.rowcount
+
+        building_result = conn.execute(
+            """
+            UPDATE hex_cells
+            SET is_building = 1
+            WHERE mission_id = ?
+              AND EXISTS (
+                SELECT 1 FROM osm_features f
+                WHERE f.mission_id = hex_cells.mission_id
+                  AND f.kind = 'building'
+                  AND ST_Contains(f.geom, hex_cells.geom)
+              )
+            """,
+            (mission_id,),
+        )
+        counts["hexes_flagged_building"] = building_result.rowcount
+
     log.info(
-        "Seeded hazards for mission %d: water=%d road=%d building=%d cliff=%d (total=%d)",
-        mission_id, counts["water"], counts["road"], counts["building"], counts["cliff"], inserted,
+        "Seeded hazards for mission %d: water=%d road=%d building=%d cliff=%d "
+        "(total=%d) flagged_danger=%d flagged_water=%d flagged_building=%d",
+        mission_id,
+        counts["water"], counts["road"], counts["building"], counts["cliff"],
+        counts["total_hazards"],
+        counts["hexes_flagged_danger"],
+        counts["hexes_flagged_water"],
+        counts["hexes_flagged_building"],
     )
     return counts
 
 
-def _explode_to_polygons(geom: dict) -> list[dict]:
-    """The hazards.geom column is POLYGON-only. Flatten MultiPolygons to a list
-    of Polygons. LineString/Point inputs are filtered out (caller is responsible
-    for buffering)."""
-    t = geom.get("type")
-    if t == "Polygon":
-        return [geom]
-    if t == "MultiPolygon":
-        return [{"type": "Polygon", "coordinates": part} for part in geom["coordinates"]]
-    return []
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

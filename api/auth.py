@@ -2,26 +2,13 @@
 from __future__ import annotations
 
 import logging
-import os
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 from api.db.users import get_user_by_token
+import api.db.missions as db_missions
 
 logger = logging.getLogger(__name__)
-
-_ADMIN_TOKEN_WARNED = False
-
-
-def _admin_token() -> str:
-    global _ADMIN_TOKEN_WARNED
-    token = os.environ.get("ADMIN_BEARER_TOKEN", "dev-admin-token")
-    if token == "dev-admin-token" and not _ADMIN_TOKEN_WARNED:
-        logger.warning(
-            "ADMIN_BEARER_TOKEN env var not set — using insecure default 'dev-admin-token'"
-        )
-        _ADMIN_TOKEN_WARNED = True
-    return token
 
 
 async def current_user(x_bearer_token: str = Header(...)) -> dict:
@@ -32,7 +19,14 @@ async def current_user(x_bearer_token: str = Header(...)) -> dict:
     return user
 
 
-async def admin_user(x_bearer_token: str = Header(...)) -> None:
-    """Verify the bearer token matches the admin token. Raises 401 on mismatch."""
-    if x_bearer_token != _admin_token():
-        raise HTTPException(status_code=401, detail="Admin access required")
+async def admin_for_mission(
+    mission_id: int,
+    user: dict = Depends(current_user),
+) -> dict:
+    """403 unless the current user is the mission creator."""
+    mission = db_missions.get_mission(mission_id)
+    if mission is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    if user["id"] != mission["created_by_user_id"]:
+        raise HTTPException(status_code=403, detail="Mission admin access required")
+    return user

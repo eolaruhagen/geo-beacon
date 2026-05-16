@@ -1,19 +1,53 @@
-# Inter-layer contracts — mission onboarding slice
+# Inter-layer contracts — hex-grid refactor
 
 Pinned function signatures so the DB / pipeline / API layers can be built in
-parallel without renegotiating. Anything not listed here is implementation
-detail and may change freely inside the owning layer.
+parallel. Anything not listed here is implementation detail and may change
+freely inside the owning layer.
 
 All timestamps are unix-epoch INTEGER seconds. All lat/lon are WGS84 floats.
-SQLite connection is obtained via `from api.db import session` (yields a
-SpatiaLite-loaded connection — context-managed, see `api/db/__init__.py`).
+SQLite connection is obtained via `from api.db import session` (SpatiaLite-loaded
+context manager).
+
+**Schema source of truth:** `migrations/001_init.sql`, `002_spatial.sql`,
+`003_terrain.sql`. There is no `004_*`. Tables: `users`, `missions`,
+`dispatches`, `broadcasts`, `pings`, `segments`, `findings`, `hazards`,
+`hex_cells`, `hex_visits`, `osm_features`. No `agent_invocation_queue`, no
+`agent_journal`, no `coverage_cache`, no `terrain_cells`.
+
+**Hazard model (important):** the `hazards` table holds **all** hazard
+polygons, including the structural ones we generate at init (water, road,
+building, cliff). It is the polygon source-of-truth. `hex_cells.flag_danger` /
+`.is_water` / `.is_building` are the **rasterized fast-cache** computed by
+intersecting hazard polygons (and raw OSM features) against the hex grid. The
+table comment in the migration is misleading — overruled.
+
+**Init order on `POST /missions`:**
+1. Create user (mission creator) — gets a bearer_token
+2. Create mission with `created_by_user_id=user.id` and a random `join_code`
+3. `fetch_terrain(mission_id)` — produces hex-cell terrain data in memory
+   (DEM-derived slope + WorldCover dominant_cover for each hex centroid),
+   inserts `osm_features` rows
+4. `seed_segments(mission_id, hex_data)` — generates ~100m segment polygons,
+   aggregates terrain stats from `hex_data`, inserts `segments`
+5. `seed_hex_cells(mission_id, hex_data)` — assigns each hex to a segment via
+   point-in-polygon, inserts `hex_cells` (with `is_water` / `is_building` /
+   `has_trail` / `has_road` derived from OSM spatial intersection)
+6. `seed_hazards(mission_id)` — derives structural hazards from `osm_features`
+   (water → critical, road buffered → caution, building buffered → caution)
+   and from `hex_cells` (slope ≥ 30° → cliff caution). Inserts into `hazards`,
+   then **rasterizes**: for each hazard polygon, sets `flag_danger=1` on every
+   `hex_cells` it intersects.
+7. Optional: any `hazards` payload from the request body is appended in
+   `seed_hazards` and rasterized the same way.
+8. `set_status(mission_id, 'active')`
+
+(Agent loop is cron-driven — no queue table to enqueue into.)
 
 ---
 
 ## Layer 1 — DB helpers (`api/db/`)
 
-Pure DB ops. No FastAPI imports, no HTTP, no geospatial math beyond calling
-SpatiaLite SQL functions.
+Pure DB ops. No FastAPI imports, no HTTP, no geospatial math beyond SpatiaLite SQL.
 
 ### `api/db/missions.py`
 
@@ -24,20 +58,23 @@ def create_mission(
     pls_lat: float,
     pls_lon: float,
     pls_ts: int,
-    area_geojson: dict,           # GeoJSON Polygon dict
+    area_geojson: dict,
+    created_by_user_id: int,
+    join_code: str,
 ) -> int:
-    """Insert mission row with area_geom from GeoJSON. status='planning'.
-    Returns new mission_id. Sets started_ts = now."""
+    """Insert mission row. status='planning'. started_ts=now. Returns mission_id."""
 
 def get_mission(mission_id: int) -> dict | None:
     """All columns plus area_geom as GeoJSON dict (key 'area_geojson')."""
 
-def set_status(mission_id: int, status: str) -> None:
-    """Update mission.status. Sets ended_ts when transitioning to ended."""
+def get_mission_by_join_code(join_code: str) -> dict | None: ...
 
-def active_mission_id() -> int | None:
-    """Returns id of the single mission with status='active', else None.
-    Spec §2 assumes single concurrent mission."""
+def set_status(mission_id: int, status: str) -> None: ...
+
+def active_mission_id_for_user(user_id: int) -> int | None:
+    """Returns mission_id of the most recent mission this user is associated
+    with (created or joined via a ping). For the single-active-mission
+    hackathon scope this is also effectively `the active mission`."""
 ```
 
 ### `api/db/users.py`
@@ -46,14 +83,12 @@ def active_mission_id() -> int | None:
 def create_user(
     display_name: str,
     callsign: str | None,
-    role: str,                    # 'searcher' | 'team_leader' | 'observer'
+    role: str = "searcher",   # 'searcher' | 'observer' — no 'team_leader'
 ) -> dict:
     """Inserts user with status='standby', random hex bearer_token (32 bytes).
     Returns {id, display_name, callsign, role, status, bearer_token, created_ts}."""
 
-def get_user_by_token(token: str) -> dict | None:
-    """Bearer-token lookup. Returns full user row or None."""
-
+def get_user_by_token(token: str) -> dict | None: ...
 def get_user(user_id: int) -> dict | None: ...
 ```
 
@@ -69,193 +104,281 @@ def insert_ping(
     accuracy_m: float | None = None,
     speed_mps: float | None = None,
     battery_pct: int | None = None,
-    source: str = "phone",         # 'phone' | 'replay' | 'manual'
-) -> int:
-    """Inserts row. geom = MakePoint(lon, lat, 4326). Returns ping_id."""
+    source: str = "phone",
+) -> int: ...
 ```
 
 ### `api/db/segments.py`
 
 ```python
-SegmentRow = dict   # keys: name, poly_geojson (Polygon dict), area_m2, poa,
-                    #       avg_slope_deg, dominant_cover, trail_length_m
+SegmentRow = dict   # keys: name, poly_geojson, area_m2, poa, avg_slope_deg,
+                    #       dominant_cover, trail_length_m
 
-def bulk_insert_segments(mission_id: int, rows: list[SegmentRow]) -> int:
-    """Insert all rows in one transaction. status='unassigned'. Returns count."""
+def bulk_insert_segments(mission_id: int, rows: list[SegmentRow]) -> list[int]:
+    """Insert all rows in one transaction. status='unassigned'.
+    Returns list of inserted ids in the same order as input rows
+    (callers need the ids to set hex_cells.segment_id)."""
 
-def segments_for_mission(mission_id: int) -> list[dict]:
-    """All columns plus geom as GeoJSON dict (key 'geom_geojson')."""
+def segments_for_mission(mission_id: int) -> list[dict]: ...
+
+def apply_hazard_penalty(mission_id: int) -> dict[str, int]:
+    """For segments intersecting hazards: critical → POA × 0, caution → × 0.3.
+    Then renormalize Σ poa = 1. Returns {critical_zeroed, caution_penalized}."""
 ```
 
-### `api/db/terrain.py`
+### `api/db/hex_cells.py` (replaces the old `api/db/terrain.py`)
 
 ```python
-TerrainCell = dict   # keys: poly_geojson, center_elev_m, avg_slope_deg, dominant_cover
-OSMFeature  = dict   # keys: kind, name (optional), geom_geojson (Polygon or LineString)
+HexCellRow = dict   # keys: poly_geojson, segment_id, center_elev_m, slope_deg,
+                    #       dominant_cover, has_trail, has_road, is_building,
+                    #       is_water
 
-def bulk_insert_terrain_cells(mission_id: int, cells: list[TerrainCell]) -> int: ...
+def bulk_insert_hex_cells(mission_id: int, rows: list[HexCellRow]) -> int: ...
+
+def hex_cells_for_mission(mission_id: int) -> list[dict]:
+    """Includes geom as GeoJSON dict (key 'poly_geojson') and all flag columns."""
+
+def rasterize_hazard_to_hex_flags(mission_id: int, hazard_id: int) -> int:
+    """For one hazard row: UPDATE hex_cells SET flag_danger=1 WHERE the hex
+    geom ST_Intersects this hazard's geom AND mission_id matches.
+    Returns count of hex_cells flagged."""
+
+def hex_cell_id_at(mission_id: int, lat: float, lon: float) -> int | None:
+    """Point-in-polygon lookup. Used by /field/findings to resolve hex_id
+    when caller provides lat/lon, and the reverse via centroid when caller
+    provides hex_id."""
+
+def set_flag_clue_for_hex(hex_id: int) -> None:
+    """Sets flag_clue=1, updates flags_updated_ts."""
+
+# OSM features stay in their own helper module — see api/db/osm.py below.
+```
+
+### `api/db/osm.py` (split out from old terrain.py)
+
+```python
+OSMFeature = dict   # keys: kind ('trail'|'road'|'water'|'building'),
+                    #       name (optional), geom_geojson (Polygon or LineString)
+
 def bulk_insert_osm_features(mission_id: int, features: list[OSMFeature]) -> int: ...
-def terrain_cells_for_mission(mission_id: int) -> list[dict]: ...
 def osm_features_for_mission(mission_id: int) -> list[dict]: ...
 ```
 
-### `api/db/geojson.py`
+### `api/db/hazards.py` (mostly unchanged — keep current signatures)
+
+```python
+def bulk_insert_hazards(mission_id: int, hazards: list[dict]) -> list[int]:
+    """Returns list of inserted hazard ids in order so callers can iterate
+    them for rasterization."""
+
+def hazards_for_mission(mission_id: int) -> list[dict]: ...
+def delete_hazards_for_mission(mission_id: int) -> int: ...
+```
+
+### `api/db/geojson.py` (extend, keep existing layers)
 
 ```python
 def mission_state_feature_collection(mission_id: int) -> dict:
-    """Returns full GeoJSON FeatureCollection per spec §11:
-      - segments: Polygon Features with properties {id, name, poa, pod, pos, status, sweep_type}
-      - searchers: latest-ping Point Features with properties {user_id, callsign, status}
-      - tracks: last-30-min Track LineString Features per searcher
-      - findings: Point Features with properties {kind, description, confidence, ts}
-      - hazards: Polygon Features with properties {kind, severity, description}
-    Result is JSON-serializable."""
+    """Per spec §11. Returns Features for:
+      - segments (Polygon, props: id, name, poa, pod, pos, status, sweep_type, assigned_user_id)
+      - hex_cells with non-default flags only (Polygon, props: id, flag_danger,
+        flag_impassable, flag_clue, flag_poi, is_water, is_building)
+      - searchers (Point, latest ping per user)
+      - tracks (LineString, last 30 min per searcher)
+      - findings (Point)
+      - hazards (Polygon, props: id, kind, severity, description)
+      - osm_features (LineString/Polygon, props: kind, name)"""
 ```
 
-### `api/db/gate.py` (queue insert helper — minimal stub for now)
+### REMOVED
 
-```python
-def enqueue_trigger(mission_id: int, trigger: str, context: dict | None = None) -> int:
-    """Inserts agent_invocation_queue row. Returns id. Worker not implemented yet."""
-```
+- `api/db/gate.py` — delete. No queue table; agent is cron-driven.
+- `api/db/terrain.py` — delete (replaced by `hex_cells.py` + `osm.py`).
 
 ---
 
-## Layer 2 — Pipelines + math
+## Layer 2 — Pipelines
 
 ### `scripts/fetch_terrain.py`
 
-CLI: `python scripts/fetch_terrain.py --mission-id N`
-
-Programmatic entry:
 ```python
-def fetch_terrain(mission_id: int) -> dict:
-    """Reads mission.area_geom from DB. Computes bbox. Fetches:
-      1) USGS NED 1/3 arcsec DEM (or fallback Open-Elevation if NED unreachable
-         — fetch_terrain MUST not block on slow government endpoints during demo).
-      2) ESA WorldCover 2021 classification (10m).
-      3) OSM trails/roads/water/buildings via Overpass API.
+def fetch_terrain(mission_id: int, mock: bool | None = None) -> dict:
+    """Reads mission.area_geom. Computes a ~30m hex grid covering the bbox.
+    For each hex centroid: queries DEM for elevation + slope, queries
+    WorldCover for dominant_cover. Inserts osm_features (DB write).
 
-    Resamples DEM + WorldCover to a ~100m grid covering the bbox.
-    Calls api.db.terrain.bulk_insert_terrain_cells with rows shaped as TerrainCell.
-    Calls api.db.terrain.bulk_insert_osm_features.
+    Does NOT insert hex_cells yet — returns them in memory so seed_segments
+    can aggregate terrain stats and assign segment_ids before insert.
 
-    Returns {terrain_cells_inserted: N, osm_features_inserted: M}.
-    Idempotent: deletes existing rows for mission_id before inserting."""
+    `mock` defaults to env TERRAIN_MOCK=1 → True, else False. Real path
+    falls back to mock on network failure (5xx, timeout, 406).
+
+    Returns:
+      {
+        "osm_features_inserted": int,
+        "hex_data": list[dict],   # each: {center_lat, center_lon, poly_geojson,
+                                    #        center_elev_m, slope_deg, dominant_cover,
+                                    #        has_trail, has_road, is_building, is_water}
+      }"""
 ```
 
-Implementation may use `rasterio`, `numpy`, `requests`, `shapely` (all in requirements.txt).
-For the hackathon, providing a `--mock` flag that generates a synthetic grid (uniform slope, mixed cover, fake trail running through bbox) is acceptable and recommended as a fallback path so the demo never depends on network reachability of public APIs.
+Mock path: synthetic hex grid (~5000 cells for 2km×2km), one trail / one road /
+one water polygon as before. Real path: USGS NED via Open-Elevation,
+WorldCover, OSM Overpass. Reuse the User-Agent / timeout fix.
 
 ### `scripts/seed_segments.py`
 
-CLI: `python scripts/seed_segments.py --mission-id N`
-
 ```python
-def seed_segments(mission_id: int) -> int:
-    """Reads mission.area_geom + terrain_cells + osm_features for mission_id.
-    Subdivides area into ~100m × 100m square grid clipped to area_geom.
-    For each cell that intersects the mission area:
-      - area_m2 from spatial calc
-      - avg_slope_deg, dominant_cover by spatial-join to terrain_cells
-      - trail_length_m by ST_Length(ST_Intersection(seg, osm trail union))
-      - raw_w from spec §7 formula (dist_term · trail_term · downhill_term · cover_term)
-    Normalize raw_w → poa. Bulk-insert via api.db.segments.bulk_insert_segments.
+def seed_segments(mission_id: int, hex_data: list[dict]) -> list[int]:
+    """Subdivides mission area into ~100m segment polygons. For each segment,
+    aggregates terrain stats from the hex_data points that fall inside it
+    (avg_slope_deg = mean, dominant_cover = mode, trail_length_m = sum from
+    has_trail hexes × 30m). Computes POA per spec §7 using agent/poa.py.
 
-    Returns number of segments inserted."""
+    Bulk-inserts via api.db.segments.bulk_insert_segments.
+    Returns the list of inserted segment ids (for the caller to use
+    when assigning hex_cells.segment_id)."""
 ```
 
-### `agent/poa.py`
-
-Pure functions, no DB:
+### `scripts/seed_hex_cells.py` (new)
 
 ```python
-def initial_poa_weights(
-    cell_centers: list[tuple[float, float]],   # (lat, lon) per cell
-    cell_elev_m: list[float],
-    cell_cover: list[str],
-    cell_has_trail: list[bool],
-    pls_lat: float,
-    pls_lon: float,
-    pls_elev_m: float,
-    sigma_m: float = 750.0,
-) -> list[float]:
-    """Computes the raw_w array per spec §7. Returns un-normalized weights;
-    caller normalizes."""
+def seed_hex_cells(mission_id: int, hex_data: list[dict],
+                   segment_ids: list[int]) -> int:
+    """For each hex in hex_data, point-in-polygon lookup against segments
+    (using SpatiaLite ST_Contains via the inserted segment ids) to find
+    its segment_id. Bulk-inserts hex_cells.
+
+    Hexes that fall outside any segment polygon are dropped (this is the
+    edge-of-bbox case — segments are clipped to the mission area).
+
+    Returns count inserted."""
 ```
+
+### `scripts/seed_hazards.py`
+
+```python
+def seed_hazards(mission_id: int) -> dict[str, int]:
+    """Inserts structural hazards into the hazards table, then rasterizes:
+    for each new hazard row, sets flag_danger=1 on intersecting hex_cells.
+
+    Sources:
+      - osm_features.kind='water'    → hazard kind='water', severity='critical'
+      - osm_features.kind='road'     → kind='other', 'caution', buffered 5m
+      - osm_features.kind='building' → kind='other', 'caution', buffered 2m
+      - hex_cells.slope_deg ≥ 30     → kind='cliff', 'caution' (one row per
+                                       connected component, falling back to
+                                       per-cell if connected-component is hard)
+
+    Also sets is_water=1 on hex_cells inside water osm_features, and
+    is_building=1 on hex_cells inside building osm_features (NOT via hazard
+    rasterization — these reflect the underlying feature type, not just
+    the danger annotation).
+
+    Returns counts {water, road, building, cliff, total_hazards,
+                    hexes_flagged_danger, hexes_flagged_water, hexes_flagged_building}.
+
+    Idempotent: delete_hazards_for_mission first, also reset relevant
+    hex_cells flags (flag_danger=0, is_water=0, is_building=0) for this
+    mission, then re-derive.
+
+    Body-param hazards from POST /missions are appended via a separate
+    call to bulk_insert_hazards + rasterize after this returns."""
+```
+
+### `agent/poa.py` (unchanged)
 
 ---
 
-## Layer 3 — FastAPI routes + plumbing
+## Layer 3 — FastAPI routes
 
 ### `api/main.py`
 
-```python
-# - FastAPI app
-# - On startup: run scripts.apply_migrations.apply()
-# - Include routers: admin, field, mission
-# - CORS open (hotspot LAN demo)
-# - Mount nothing else
-```
+- FastAPI app, CORS open
+- Startup hook runs `apply_migrations`
+- Includes routers: `missions`, `field`, `mission`, `admin`
 
 ### `api/auth.py`
 
 ```python
 async def current_user(x_bearer_token: str = Header(...)) -> dict:
-    """FastAPI dependency. Looks up via api.db.users.get_user_by_token.
-    Raises HTTPException(401) on miss. Returns full user dict."""
+    """Looks up via api.db.users.get_user_by_token. 401 on miss."""
 
-# Optionally an admin_user dependency that checks role='team_leader' or a
-# static admin bearer from env (ADMIN_BEARER_TOKEN). Use env-only for demo:
-# if X-Bearer-Token matches env ADMIN_BEARER_TOKEN, pass; else 401.
+async def admin_for_mission(mission_id: int, user: dict = Depends(current_user)) -> dict:
+    """403 unless user.id == missions.created_by_user_id."""
 ```
+
+(No more env-var ADMIN_BEARER_TOKEN. Admin = mission creator.)
 
 ### `api/schemas.py`
 
-Pydantic v2 models for all request/response bodies. Match spec §11 exactly.
+Pydantic v2 for all bodies. Validators: lat in [-90,90], lon in [-180,180],
+confidence in [0,1], role in {searcher, observer}, hazard kind/severity per
+the migration CHECK constraints.
 
-### `api/routes/admin.py`
+### `api/routes/missions.py` (replaces `admin.py`)
 
-Per spec §11:
+```python
+POST /missions
+  body: {
+    name, subject_description, pls_lat, pls_lon, pls_ts, area_geojson,
+    display_name, callsign?, hazards?   # hazards = optional list of
+                                        # {kind, severity, description, poly_geojson}
+  }
+  flow:
+    user = db_users.create_user(display_name, callsign, "searcher")
+    mission_id = db_missions.create_mission(..., created_by_user_id=user.id,
+                                            join_code=randint())
+    terrain = fetch_terrain(mission_id)
+    segment_ids = seed_segments(mission_id, terrain["hex_data"])
+    n_hex = seed_hex_cells(mission_id, terrain["hex_data"], segment_ids)
+    hazard_counts = seed_hazards(mission_id)
+    if body.hazards:
+        ids = bulk_insert_hazards(mission_id, body.hazards)
+        for h_id in ids:
+            rasterize_hazard_to_hex_flags(mission_id, h_id)
+    apply_hazard_penalty(mission_id)
+    set_status(mission_id, "active")
+  returns: {mission_id, join_code, bearer_token, user_id, n_segments,
+            n_hex_cells, n_hazards}
 
-- `POST /admin/mission` — body validated by pydantic, calls
-  `db.missions.create_mission`, then synchronously calls
-  `scripts.fetch_terrain.fetch_terrain(mission_id)` and
-  `scripts.seed_segments.seed_segments(mission_id)`, then
-  `db.missions.set_status(mission_id, 'active')`, then
-  `db.gate.enqueue_trigger(mission_id, 'mission_start')`. Returns
-  `{mission_id, n_segments, n_terrain_cells}`.
-
-  Synchronous orchestration is acceptable for hackathon — fetch_terrain
-  takes ~30s with `--mock`. For real fetch, accept that the request may
-  take longer; client should show a spinner.
-
-- `POST /admin/users` — calls `db.users.create_user`, returns
-  `{user_id, bearer_token, callsign}`.
+POST /missions/join
+  body: {join_code, display_name, callsign?, role?}
+  flow:
+    mission = get_mission_by_join_code(join_code)  # 404 if not found
+    user = create_user(display_name, callsign, role or "searcher")
+  returns: {mission_id, bearer_token, user_id, callsign}
+```
 
 ### `api/routes/field.py`
 
-- `POST /field/ping` — body `{lat, lon, ts?, accuracy_m?, speed_mps?, battery_pct?}`.
-  Resolves user from bearer token. mission_id = `db.missions.active_mission_id()`.
-  Calls `db.pings.insert_ping`. Returns `{ping_id}`. (Gate triggers
-  `divergence`/`no_comms_recovery` are deferred to spatial worker, not
-  fired here.)
-- `GET /field/me` — stub returning `{user, active_dispatch: null, segment_geojson: null, nearby_hazards: [], recent_broadcasts: []}` for now. Full impl later.
+- `POST /field/ping` — auth via bearer, mission_id resolved via
+  `active_mission_id_for_user(user.id)`. Same as before.
+- `GET /field/me` — same stub for now; `nearby_hazards` query is a follow-up.
+- `POST /field/findings` — new: accepts `{lat, lon, kind, description, confidence}`
+  OR `{hex_id, ...}`. Server resolves the other. Sets `hex_cells.flag_clue=1`.
 
 ### `api/routes/mission.py`
 
-- `GET /mission/state.geojson?mission_id=N` — optional query param. If
-  omitted, uses `db.missions.active_mission_id()`. Calls
-  `db.geojson.mission_state_feature_collection`. Returns the FeatureCollection
-  with `Content-Type: application/geo+json`.
+- `GET /mission/state.geojson?mission_id=N` — calls
+  `db.geojson.mission_state_feature_collection`. New features include
+  `hex_cells` (filtered to non-default flags) + `osm_features`.
+
+### `api/routes/admin.py` (smaller now)
+
+- `POST /admin/agent/invoke` — stub for now, returns 501 or no-op.
+- `POST /admin/mission/{id}/finish` — sets status='ended'. Uses
+  `admin_for_mission` dependency.
 
 ---
 
-## Test points
+## Out of scope for THIS refactor
 
-Each layer should be runnable end-to-end manually:
+- Hex-counting POD math (needs spatial worker; agent loop work)
+- `GET /field/me/route` snap-to-trail
+- `GET /mission/timeline` event feed
+- Agent invocation (cron skeleton)
+- Replay worker
 
-1. `./dev/reset-db.sh` — clean DB with migrations applied.
-2. `python -c "from api.db.users import create_user; print(create_user('Dev','Alpha','searcher'))"` — DB layer smoke test.
-3. `python scripts/fetch_terrain.py --mission-id 1 --mock` — pipeline smoke test (needs a mission row).
-4. `./dev/run-api.sh` then `curl -X POST http://localhost:8000/admin/mission -H 'X-Bearer-Token: $ADMIN' -d @fixtures/mission_wilder.json` — full E2E.
+User's instruction: "no need to be perfect, just have the proper data shapes
+aligned, if slight bugs ship its ok, ill fix them up as they integrate".
