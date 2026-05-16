@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -27,6 +28,7 @@ from scripts.apply_migrations import apply, DEFAULT_DB_PATH, DEFAULT_MIGRATIONS_
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PARALLELISM = 3
+DEFAULT_LOG_PATH = Path(tempfile.gettempdir()) / "geo-beacon" / "routing-agent.jsonl"
 
 ROUTER_SYSTEM_PROMPT = """You dispatch one search-and-rescue volunteer per call.
 The user message contains a 10x10 local view centered on that volunteer plus
@@ -74,6 +76,85 @@ class RoutingResult:
     dispatch: dict[str, Any] | None = None
     error: str | None = None
     model_text: str | None = None
+
+
+def _log_path(args: argparse.Namespace) -> Path | None:
+    if not getattr(args, "log_enabled", True):
+        return None
+    return Path(getattr(args, "log_path", DEFAULT_LOG_PATH))
+
+
+def _append_log(log_path: Path | None, record: dict[str, Any]) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    event = {"ts": int(time.time()), **record}
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+
+
+def _log_agent_call(
+    log_path: Path | None,
+    context: DispatchContext,
+    *,
+    mode: str,
+    dry_run: bool,
+    duration_s: float,
+    status: str,
+    include_payload: bool,
+    decision: dict[str, Any] | None = None,
+    model_text: str | None = None,
+    error: str | None = None,
+) -> None:
+    record: dict[str, Any] = {
+        "event": "agent_call",
+        "mission_id": context.mission_id,
+        "user_id": context.user_id,
+        "callsign": context.callsign,
+        "mode": mode,
+        "dry_run": dry_run,
+        "duration_s": duration_s,
+        "status": status,
+        "decision": decision,
+        "model_text": model_text,
+        "error": error,
+    }
+    if include_payload:
+        record["payload"] = context.text
+    _append_log(
+        log_path,
+        record,
+    )
+
+
+def _log_dispatch_call(
+    log_path: Path | None,
+    context: DispatchContext,
+    *,
+    target_hex_id: int,
+    reasoning: str,
+    instruction: str,
+    duration_s: float,
+    status: str,
+    dispatch: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    _append_log(
+        log_path,
+        {
+            "event": "dispatch_call",
+            "mission_id": context.mission_id,
+            "user_id": context.user_id,
+            "callsign": context.callsign,
+            "target_hex_id": target_hex_id,
+            "reasoning": reasoning,
+            "instruction": instruction,
+            "duration_s": duration_s,
+            "status": status,
+            "dispatch": dispatch,
+            "error": error,
+        },
+    )
 
 
 def _command_from_env() -> list[str] | None:
@@ -247,9 +328,12 @@ def _route_one(
     timeout_seconds: int | None,
     dry_run: bool,
     fallback_heuristic: bool,
+    log_path: Path | None,
+    log_payloads: bool,
 ) -> RoutingResult:
     started = time.time()
     model_text: str | None = None
+    agent_logged = False
     try:
         if mode == "heuristic":
             decision = _heuristic_decision(context)
@@ -264,6 +348,18 @@ def _route_one(
             "source": decision.source,
         }
         if decision.target_col is None or decision.target_row is None:
+            _log_agent_call(
+                log_path,
+                context,
+                mode=mode,
+                dry_run=dry_run,
+                duration_s=round(time.time() - started, 2),
+                status="no_action",
+                include_payload=log_payloads,
+                decision=decision_dict,
+                model_text=model_text,
+            )
+            agent_logged = True
             return RoutingResult(
                 mission_id=context.mission_id,
                 user_id=context.user_id,
@@ -276,14 +372,51 @@ def _route_one(
 
         target_hex_id = context.hex_id_for(decision.target_col, decision.target_row)
         instruction = f"Move to local cell ({decision.target_col}, {decision.target_row})."
+        decision_with_target = {**decision_dict, "target_hex_id": target_hex_id}
+        _log_agent_call(
+            log_path,
+            context,
+            mode=mode,
+            dry_run=dry_run,
+            duration_s=round(time.time() - started, 2),
+            status="selected_target",
+            include_payload=log_payloads,
+            decision=decision_with_target,
+            model_text=model_text,
+        )
+        agent_logged = True
         dispatch = None
         if not dry_run:
-            dispatch = _dispatch_with_retry(
-                user_id=context.user_id,
+            dispatch_started = time.time()
+            try:
+                dispatch = _dispatch_with_retry(
+                    user_id=context.user_id,
+                    target_hex_id=target_hex_id,
+                    reasoning=decision.reasoning,
+                    instruction=instruction,
+                    mission_id=context.mission_id,
+                )
+            except Exception as exc:
+                _log_dispatch_call(
+                    log_path,
+                    context,
+                    target_hex_id=target_hex_id,
+                    reasoning=decision.reasoning,
+                    instruction=instruction,
+                    duration_s=round(time.time() - dispatch_started, 2),
+                    status="error",
+                    error=str(exc),
+                )
+                raise
+            _log_dispatch_call(
+                log_path,
+                context,
                 target_hex_id=target_hex_id,
                 reasoning=decision.reasoning,
                 instruction=instruction,
-                mission_id=context.mission_id,
+                duration_s=round(time.time() - dispatch_started, 2),
+                status="ok",
+                dispatch=dispatch,
             )
 
         return RoutingResult(
@@ -292,11 +425,23 @@ def _route_one(
             callsign=context.callsign,
             status="dispatched" if not dry_run else "dry_run",
             duration_s=round(time.time() - started, 2),
-            decision={**decision_dict, "target_hex_id": target_hex_id},
+            decision=decision_with_target,
             dispatch=dispatch,
             model_text=model_text,
         )
     except Exception as exc:
+        if not agent_logged:
+            _log_agent_call(
+                log_path,
+                context,
+                mode=mode,
+                dry_run=dry_run,
+                duration_s=round(time.time() - started, 2),
+                status="error",
+                include_payload=log_payloads,
+                model_text=model_text,
+                error=str(exc),
+            )
         return RoutingResult(
             mission_id=context.mission_id,
             user_id=context.user_id,
@@ -348,6 +493,7 @@ def _contexts_for_tick(
 
 
 def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
+    log_path = _log_path(args)
     apply(os.environ.get("MISSION_DB_PATH", DEFAULT_DB_PATH), DEFAULT_MIGRATIONS_DIR)
     contexts, skipped = _contexts_for_tick(args)
     if args.print_payloads:
@@ -384,6 +530,8 @@ def run_tick(args: argparse.Namespace) -> list[RoutingResult]:
                 timeout_seconds=args.timeout_seconds,
                 dry_run=args.dry_run,
                 fallback_heuristic=args.fallback_heuristic,
+                log_path=log_path,
+                log_payloads=getattr(args, "log_payloads", True),
             )
             for context in contexts
         ]
@@ -442,8 +590,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Run model/heuristic but do not write dispatch rows")
     parser.add_argument("--payloads-only", action="store_true", help="Build payloads and exit without model calls")
     parser.add_argument("--print-payloads", action="store_true")
+    parser.add_argument(
+        "--log-path",
+        type=Path,
+        default=Path(os.environ.get("ROUTING_AGENT_LOG_PATH") or DEFAULT_LOG_PATH),
+        help="JSONL audit log for agent_call and dispatch_call records",
+    )
+    parser.add_argument("--no-log", dest="log_enabled", action="store_false", help="Disable routing audit logging")
+    parser.add_argument(
+        "--no-log-payloads",
+        dest="log_payloads",
+        action="store_false",
+        help="Keep action logs but omit the full ASCII payload text",
+    )
     parser.add_argument("--no-fallback-heuristic", dest="fallback_heuristic", action="store_false")
-    parser.set_defaults(fallback_heuristic=True)
+    parser.set_defaults(fallback_heuristic=True, log_enabled=True, log_payloads=True)
     parser.add_argument(
         "--mode",
         choices=("llm", "heuristic"),
