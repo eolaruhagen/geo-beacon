@@ -1,0 +1,14 @@
+# Core API + workers
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+pydantic==2.*
+python-multipart==0.0.*    # multipart form parsing (file upload)
+httpx==0.27.*              # replay_worker hits its own /field/* endpoints
+
+# Geometry helpers used in-Python (POA bumps, route hints, sanity checks)
+shapely==2.*
+
+# Terrain prep (only fetch_terrain.py needs these; safe to install everywhere)
+rasterio==1.4.*
+numpy==2.*
+requests==2.32.*           # Overpass API + raster downloads

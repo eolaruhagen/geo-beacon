@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+*.egg-info/
+
+# Local DB + terrain cache
+# (on DGX the DB lives at /home/asus/sqlite/, in dev at dev/data/)
+*.db
+*.db-wal
+*.db-shm
+/data/             # repo-root data dir if anyone uses it
+dev/data/*         # local dev DB files, but keep the dir tracked
+!dev/data/.gitkeep
+logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+.env.local
+.dgx-pass
