@@ -88,17 +88,19 @@ def set_status(mission_id: int, status: str) -> None:
 
 
 def active_mission_id_for_user(user_id: int) -> int | None:
-    """Returns mission_id of the mission this user is currently associated with.
+    """Returns the user's currently-affiliated mission id, or None.
 
-    Lookup order (migration 004 added users.current_mission_id, which is the
-    authoritative source now):
-      1. users.current_mission_id direct read — set when the user creates or
-         joins a mission.
-      2. Defensive fallback: mission this user created (created_by_user_id)
-         OR most recent mission this user has pinged into. Kept around in case
-         a legacy row has current_mission_id NULL.
-      3. Final fallback: the single mission with status='active', if exactly
-         one exists. Matches the single-active-mission scope per spec §2.
+    Authoritative source: users.current_mission_id. Set when the user creates
+    a mission (api/routes/missions.py:POST /missions) or joins one
+    (api/routes/missions.py:POST /missions/join).
+
+    AUTH-2: the previous "single active mission" global fallback and the
+    created-by/pings inference fallback were removed. They let an unaffiliated
+    user implicitly land in someone else's mission as soon as exactly one
+    mission was live — a real auth hole given the demo deploy has exactly one
+    active mission at a time. If a user has NULL current_mission_id, the
+    correct response is "no active mission" (None), forcing the caller to
+    surface a 409 / 404.
     """
     with session() as conn:
         row = conn.execute(
@@ -107,24 +109,4 @@ def active_mission_id_for_user(user_id: int) -> int | None:
         ).fetchone()
         if row is not None and row["current_mission_id"] is not None:
             return row["current_mission_id"]
-
-        row = conn.execute(
-            """
-            SELECT id FROM missions
-            WHERE created_by_user_id = ?
-            UNION
-            SELECT DISTINCT mission_id AS id FROM pings
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (user_id, user_id),
-        ).fetchone()
-        if row:
-            return row["id"]
-        active = conn.execute(
-            "SELECT id FROM missions WHERE status = 'active'"
-        ).fetchall()
-        if len(active) == 1:
-            return active[0]["id"]
         return None

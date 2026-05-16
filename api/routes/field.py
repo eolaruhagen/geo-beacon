@@ -16,7 +16,14 @@ from api.db.hex_cells import (
     rasterize_hazard_to_hex_flags,
     set_flag_clue_for_hex,
 )
-from api.schemas import FindingRequest, FindingResponse, MeResponse, PingRequest, PingResponse
+from api.schemas import (
+    FindingRequest,
+    FindingResponse,
+    MeResponse,
+    PingRequest,
+    PingResponse,
+    UserPublic,
+)
 import api.db.missions as db_missions
 import api.db.pings as db_pings
 
@@ -53,7 +60,7 @@ async def field_ping(
 async def field_me(user: dict = Depends(current_user)) -> MeResponse:
     mission_id = db_missions.active_mission_id_for_user(user["id"])
     return MeResponse(
-        user=user,
+        user=UserPublic.model_validate(user),
         mission_id=mission_id,
     )
 

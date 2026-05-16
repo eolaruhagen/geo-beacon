@@ -17,8 +17,9 @@ def create_user(
     current_mission_id, created_ts}.
 
     Callsign uniqueness is scoped per-mission via UNIQUE(current_mission_id,
-    callsign) (see migration 004). On collision within a mission, SQLite raises
-    `sqlite3.IntegrityError`; callers (route layer) translate that to HTTP 409.
+    callsign) in migrations/001_init.sql. On collision within a mission,
+    SQLite raises `sqlite3.IntegrityError`; the route layer translates that to
+    HTTP 409.
     """
     token = secrets.token_hex(32)
     now = int(time.time())

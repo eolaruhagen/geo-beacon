@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Literal aliases mirror the DB CHECK constraints in migrations/. Keep these
 # in sync if a migration changes the allowed values.
@@ -110,8 +110,7 @@ class FindingRequest(BaseModel):
     hex_id: Optional[int] = None
     # F-3: findings.kind CHECK in migrations/002_spatial.sql:74.
     kind: FindingKind
-    # F-2: findings.description is nullable per migrations/004_user_mission_and_validation.sql
-    # (was NOT NULL in 002, relaxed in 004 since most quick taps carry no text).
+    # F-2: findings.description is nullable per migrations/002_spatial.sql.
     description: Optional[str] = None
     confidence: float = Field(ge=0, le=1)
 
@@ -129,10 +128,26 @@ class FindingResponse(BaseModel):
     hex_id: Optional[int]
 
 
+class UserPublic(BaseModel):
+    # Safe-to-expose projection of users — drops bearer_token and phone (PYD-1).
+    # Used in MeResponse and anywhere else a user is returned to a caller.
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    display_name: str
+    callsign: Optional[str]
+    role: UserRole
+    status: str
+    current_mission_id: Optional[int]
+
+
 class MeResponse(BaseModel):
-    user: Any
+    user: UserPublic
     mission_id: Optional[int] = None
-    active_dispatch: None = None
-    segment_geojson: None = None
+    # active_dispatch / segment_geojson will become populated optionals when the
+    # dispatch endpoints land (SPEC-2). For now they're null but the field types
+    # are Optional[Any] so the wire shape stays stable across that change.
+    active_dispatch: Optional[Any] = None
+    segment_geojson: Optional[Any] = None
     nearby_hazards: List = Field(default_factory=list)
     recent_broadcasts: List = Field(default_factory=list)
