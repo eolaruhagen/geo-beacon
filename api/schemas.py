@@ -28,6 +28,16 @@ HazardSeverity = Literal[
 
 UserRole = Literal["searcher", "observer"]  # migrations/001_init.sql:19 (users.role CHECK)
 
+DispatchStatus = Literal[
+    "pending", "acked", "in_progress", "completed", "cancelled", "superseded"
+]  # migrations/001_init.sql:59 (dispatches.status CHECK)
+
+SweepType = Literal["hasty", "efficient", "thorough"]  # migrations/001_init.sql:54
+
+BroadcastKind = Literal[
+    "info", "warning", "recall", "finding_alert", "route_correction"
+]  # migrations/001_init.sql:73 (broadcasts.kind CHECK)
+
 
 class HazardInput(BaseModel):
     # H-2: hazards.geom is registered as POLYGON (singular) in
@@ -141,13 +151,87 @@ class UserPublic(BaseModel):
     current_mission_id: Optional[int]
 
 
+class ActiveDispatch(BaseModel):
+    """Single in-flight dispatch for a searcher (status in pending/acked/in_progress)."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    mission_id: int
+    user_id: int
+    segment_id: Optional[int]
+    sweep_type: Optional[SweepType]
+    entry_lat: Optional[float]
+    entry_lon: Optional[float]
+    instruction: str
+    reasoning: str
+    status: DispatchStatus
+    issued_ts: int
+    acked_ts: Optional[int]
+    started_ts: Optional[int]
+    completed_ts: Optional[int]
+
+
+class DispatchCompleteRequest(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class DispatchActionResponse(BaseModel):
+    dispatch_id: int
+    status: DispatchStatus
+    user_status: str
+
+
+class Broadcast(BaseModel):
+    """Single broadcast row, already filtered through the visibility policy
+    in api/db/broadcasts.py (scope is 'all' or 'user:{caller_id}')."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    scope: str
+    kind: BroadcastKind
+    message: str
+    ts: int
+
+
+class AnnouncementsResponse(BaseModel):
+    """Return shape for GET /field/announcements?since=ts.
+
+    `cursor_ts` is the latest broadcast `ts` in this batch (or echo of
+    `since` if empty). The app stores this and re-polls with
+    `?since=cursor_ts` for incremental delivery.
+    """
+    broadcasts: List[Broadcast]
+    cursor_ts: int
+
+
+class RouteWaypoint(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+
+class RouteResponse(BaseModel):
+    """Snap-to-trail route from the searcher's last known position to the
+    target segment's entry point. Spec §13 query_route: snap only, no
+    along-trail path. App renders a polyline through `waypoints` in order.
+
+    `snapped`: false when the mission has no trail features (or the closest
+    is degenerate) — in that case `waypoints` is just [start, target] and
+    the app should render a bee-line.
+    """
+    waypoints: List[RouteWaypoint]
+    snapped: bool
+
+
 class MeResponse(BaseModel):
     user: UserPublic
     mission_id: Optional[int] = None
-    # active_dispatch / segment_geojson will become populated optionals when the
-    # dispatch endpoints land (SPEC-2). For now they're null but the field types
-    # are Optional[Any] so the wire shape stays stable across that change.
-    active_dispatch: Optional[Any] = None
-    segment_geojson: Optional[Any] = None
+    active_dispatch: Optional[ActiveDispatch] = None
+    # GeoJSON Feature for the active dispatch's segment (with properties:
+    # name, poa, pod, sweep_type, terrain stats). None when no active dispatch
+    # or the dispatch is a recall (segment_id NULL).
+    segment_geojson: Optional[dict[str, Any]] = None
     nearby_hazards: List = Field(default_factory=list)
-    recent_broadcasts: List = Field(default_factory=list)
+    # Already scope-filtered via api/db/broadcasts.visible_broadcasts_for_user.
+    # Capped to the most recent few so the 5s poll stays cheap; full history
+    # lives behind GET /field/announcements?since=ts.
+    recent_broadcasts: List[Broadcast] = Field(default_factory=list)
