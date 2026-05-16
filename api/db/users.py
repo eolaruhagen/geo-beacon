@@ -1,68 +1,66 @@
 from __future__ import annotations
 
 import secrets
-import sqlite3
 import time
 
 from api.db import session
-
-
-def _disambiguate_callsign(conn: sqlite3.Connection, callsign: str | None) -> str | None:
-    """If `callsign` is already taken in users.callsign (which is UNIQUE),
-    append `-2`, `-3`, ... until we find a free one. Mostly a dev-loop nicety —
-    real callsign scoping should be per-mission but that needs a schema change."""
-    if callsign is None:
-        return None
-    row = conn.execute("SELECT 1 FROM users WHERE callsign = ?", (callsign,)).fetchone()
-    if row is None:
-        return callsign
-    n = 2
-    while True:
-        candidate = f"{callsign}-{n}"
-        row = conn.execute("SELECT 1 FROM users WHERE callsign = ?", (candidate,)).fetchone()
-        if row is None:
-            return candidate
-        n += 1
 
 
 def create_user(
     display_name: str,
     callsign: str | None,
     role: str = "searcher",
+    current_mission_id: int | None = None,
 ) -> dict:
     """Inserts user with status='standby', random hex bearer_token (32 bytes).
-    Returns {id, display_name, callsign, role, status, bearer_token, created_ts}.
+    Returns {id, display_name, callsign, role, status, bearer_token,
+    current_mission_id, created_ts}.
 
-    If `callsign` is already taken, auto-disambiguates to `<callsign>-2`,
-    `<callsign>-3`, etc. so repeat smoke-tests and same-name joins both work."""
+    Callsign uniqueness is scoped per-mission via UNIQUE(current_mission_id,
+    callsign) (see migration 004). On collision within a mission, SQLite raises
+    `sqlite3.IntegrityError`; callers (route layer) translate that to HTTP 409.
+    """
     token = secrets.token_hex(32)
     now = int(time.time())
     with session() as conn:
-        final_callsign = _disambiguate_callsign(conn, callsign)
         cur = conn.execute(
             """
-            INSERT INTO users (display_name, callsign, role, status, bearer_token, created_ts)
-            VALUES (?, ?, ?, 'standby', ?, ?)
+            INSERT INTO users (display_name, callsign, role, status, bearer_token,
+                               current_mission_id, created_ts)
+            VALUES (?, ?, ?, 'standby', ?, ?, ?)
             """,
-            (display_name, final_callsign, role, token, now),
+            (display_name, callsign, role, token, current_mission_id, now),
         )
         user_id = cur.lastrowid
         return {
             "id": user_id,
             "display_name": display_name,
-            "callsign": final_callsign,
+            "callsign": callsign,
             "role": role,
             "status": "standby",
             "bearer_token": token,
+            "current_mission_id": current_mission_id,
             "created_ts": now,
         }
+
+
+def set_current_mission(user_id: int, mission_id: int) -> None:
+    """Set the user's current_mission_id. Used when a user creates or joins a
+    mission, so subsequent lookups (e.g. active_mission_id_for_user) and the
+    per-mission callsign uniqueness constraint both work directly."""
+    with session() as conn:
+        conn.execute(
+            "UPDATE users SET current_mission_id = ? WHERE id = ?",
+            (mission_id, user_id),
+        )
 
 
 def get_user_by_token(token: str) -> dict | None:
     """Bearer-token lookup. Returns full user row or None."""
     with session() as conn:
         row = conn.execute(
-            "SELECT id, display_name, callsign, phone, role, status, bearer_token, created_ts "
+            "SELECT id, display_name, callsign, phone, role, status, bearer_token, "
+            "current_mission_id, created_ts "
             "FROM users WHERE bearer_token = ?",
             (token,),
         ).fetchone()
@@ -72,7 +70,8 @@ def get_user_by_token(token: str) -> dict | None:
 def get_user(user_id: int) -> dict | None:
     with session() as conn:
         row = conn.execute(
-            "SELECT id, display_name, callsign, phone, role, status, bearer_token, created_ts "
+            "SELECT id, display_name, callsign, phone, role, status, bearer_token, "
+            "current_mission_id, created_ts "
             "FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()

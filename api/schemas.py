@@ -5,25 +5,42 @@ from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-VALID_HAZARD_KINDS = {"cliff", "water", "weather", "no_comms_zone", "wildlife", "other"}
-VALID_HAZARD_SEVERITIES = {"info", "caution", "critical"}
-VALID_ROLES = {"searcher", "observer"}
+# Literal aliases mirror the DB CHECK constraints in migrations/. Keep these
+# in sync if a migration changes the allowed values.
+FindingKind = Literal[
+    "clue",
+    "subject_found",
+    "subject_sighting",
+    "hazard",
+    "footprint",
+    "discarded_item",
+    "note",
+    "other",
+]  # migrations/002_spatial.sql:74 (findings.kind CHECK)
+
+HazardKind = Literal[
+    "cliff", "water", "weather", "no_comms_zone", "wildlife", "other"
+]  # migrations/002_spatial.sql:97 (hazards.kind CHECK)
+
+HazardSeverity = Literal[
+    "info", "caution", "critical"
+]  # migrations/002_spatial.sql:98 (hazards.severity CHECK)
+
+UserRole = Literal["searcher", "observer"]  # migrations/001_init.sql:19 (users.role CHECK)
 
 
 class HazardInput(BaseModel):
-    kind: str
-    severity: str
-    description: Optional[str] = None
+    # H-2: hazards.geom is registered as POLYGON (singular) in
+    # migrations/002_spatial.sql:103 — SpatiaLite rejects MultiPolygon at INSERT.
+    kind: HazardKind
+    severity: HazardSeverity
+    description: str = Field(min_length=1)  # hazards.description is NOT NULL
     poly_geojson: dict[str, Any]
 
     @model_validator(mode="after")
-    def validate_kind_severity(self) -> "HazardInput":
-        if self.kind not in VALID_HAZARD_KINDS:
-            raise ValueError(f"kind must be one of {VALID_HAZARD_KINDS}")
-        if self.severity not in VALID_HAZARD_SEVERITIES:
-            raise ValueError(f"severity must be one of {VALID_HAZARD_SEVERITIES}")
-        if self.poly_geojson.get("type") not in ("Polygon", "MultiPolygon"):
-            raise ValueError("poly_geojson must be a GeoJSON Polygon or MultiPolygon")
+    def validate_poly_geojson(self) -> "HazardInput":
+        if self.poly_geojson.get("type") != "Polygon":
+            raise ValueError("poly_geojson must be a GeoJSON Polygon (MultiPolygon not supported)")
         return self
 
 
@@ -40,9 +57,11 @@ class CreateMissionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_area_geojson(self) -> "CreateMissionRequest":
-        geom = self.area_geojson
-        if geom.get("type") not in ("Polygon", "MultiPolygon"):
-            raise ValueError("area_geojson must be a GeoJSON Polygon or MultiPolygon")
+        # MI-1: missions.area_geom is POLYGON (migrations/002_spatial.sql:16).
+        # SpatiaLite rejects MultiPolygon at INSERT, so reject it up front.
+        geom_type = self.area_geojson.get("type")
+        if geom_type != "Polygon":
+            raise ValueError("area_geojson must be a GeoJSON Polygon (MultiPolygon not supported)")
         return self
 
 
@@ -60,13 +79,7 @@ class JoinMissionRequest(BaseModel):
     join_code: str = Field(min_length=1)
     display_name: str = Field(min_length=1)
     callsign: Optional[str] = None
-    role: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_role(self) -> "JoinMissionRequest":
-        if self.role is not None and self.role not in VALID_ROLES:
-            raise ValueError(f"role must be one of {VALID_ROLES}")
-        return self
+    role: Optional[UserRole] = None  # users.role CHECK (migrations/001_init.sql:19)
 
 
 class JoinMissionResponse(BaseModel):
@@ -83,6 +96,8 @@ class PingRequest(BaseModel):
     accuracy_m: Optional[float] = None
     speed_mps: Optional[float] = None
     battery_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # NOTE: pings.source is NOT NULL with CHECK ('phone','replay','manual') but
+    # is set server-side (default 'phone' for this endpoint), so not on the wire.
 
 
 class PingResponse(BaseModel):
@@ -93,7 +108,10 @@ class FindingRequest(BaseModel):
     lat: Optional[float] = Field(default=None, ge=-90, le=90)
     lon: Optional[float] = Field(default=None, ge=-180, le=180)
     hex_id: Optional[int] = None
-    kind: str = Field(min_length=1)
+    # F-3: findings.kind CHECK in migrations/002_spatial.sql:74.
+    kind: FindingKind
+    # F-2: findings.description is nullable per migrations/004_user_mission_and_validation.sql
+    # (was NOT NULL in 002, relaxed in 004 since most quick taps carry no text).
     description: Optional[str] = None
     confidence: float = Field(ge=0, le=1)
 

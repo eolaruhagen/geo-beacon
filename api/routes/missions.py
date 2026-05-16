@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import sqlite3
 
 from fastapi import APIRouter, HTTPException
 
@@ -42,6 +43,10 @@ async def create_mission(body: CreateMissionRequest) -> CreateMissionResponse:
         created_by_user_id=user["id"],
         join_code=join_code,
     )
+
+    # Implicitly join creator to their own mission, so their first /field/ping
+    # works without a separate /missions/join call.
+    db_users.set_current_mission(user["id"], mission_id)
 
     hex_data: list[dict] = []
     try:
@@ -115,11 +120,24 @@ async def join_mission(body: JoinMissionRequest) -> JoinMissionResponse:
     if mission is None:
         raise HTTPException(status_code=404, detail="Join code not found")
 
-    user = db_users.create_user(
-        display_name=body.display_name,
-        callsign=body.callsign,
-        role=body.role or "searcher",
-    )
+    try:
+        user = db_users.create_user(
+            display_name=body.display_name,
+            callsign=body.callsign,
+            role=body.role or "searcher",
+            current_mission_id=mission["id"],
+        )
+    except sqlite3.IntegrityError as e:
+        # Per-mission callsign collision (UNIQUE(current_mission_id, callsign))
+        # is the expected case here. Bearer token collisions are vanishingly
+        # unlikely with 32 random bytes; bucket them all into 409.
+        logger.info("join_mission integrity error (mission_id=%s, callsign=%r): %s",
+                    mission["id"], body.callsign, e)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Callsign {body.callsign!r} is already in use in this mission. "
+                   "Pick a different one.",
+        )
 
     return JoinMissionResponse(
         mission_id=mission["id"],

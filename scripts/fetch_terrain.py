@@ -31,7 +31,7 @@ from api.db.osm import bulk_insert_osm_features
 
 log = logging.getLogger("fetch_terrain")
 
-# ~30m step at mid-latitudes
+# ~30m flat-to-flat hex distance at mid-latitudes
 _CELL_SIZE_M = 30.0
 
 
@@ -46,22 +46,34 @@ def _bbox_from_geojson(geojson: dict) -> tuple[float, float, float, float]:
     return min(lats), min(lons), max(lats), max(lons)
 
 
-def _deg_per_cell(lat: float) -> tuple[float, float]:
-    dlat = _CELL_SIZE_M / 111_320.0
-    dlon = _CELL_SIZE_M / (111_320.0 * math.cos(math.radians(lat)))
-    return dlat, dlon
+def _hex_steps(lat: float) -> tuple[float, float, float, float]:
+    """Return (dlat_step, dlon_step, R_lat, R_lon) for a flat-top hex grid.
+
+    `_CELL_SIZE_M` is interpreted as the flat-to-flat hex distance (short
+    diameter). For a flat-top hex with radius R (centroid-to-vertex):
+        flat-to-flat = R * sqrt(3)
+        column step  = 1.5 * R          (centroid-to-centroid horizontal)
+        row step     = flat-to-flat     (centroid-to-centroid vertical)
+    """
+    R_meters = _CELL_SIZE_M / math.sqrt(3.0)
+    dx_meters = 1.5 * R_meters  # column step
+    dy_meters = _CELL_SIZE_M    # row step = flat-to-flat
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat))
+    dlat_step = dy_meters / m_per_deg_lat
+    dlon_step = dx_meters / m_per_deg_lon
+    R_lat = R_meters / m_per_deg_lat
+    R_lon = R_meters / m_per_deg_lon
+    return dlat_step, dlon_step, R_lat, R_lon
 
 
-def _cell_polygon(lat: float, lon: float, dlat: float, dlon: float) -> dict:
-    half_lat = dlat / 2
-    half_lon = dlon / 2
-    ring = [
-        [lon - half_lon, lat - half_lat],
-        [lon + half_lon, lat - half_lat],
-        [lon + half_lon, lat + half_lat],
-        [lon - half_lon, lat + half_lat],
-        [lon - half_lon, lat - half_lat],
-    ]
+def _hex_polygon(lat: float, lon: float, R_lat: float, R_lon: float) -> dict:
+    """Flat-top hex with 6 vertices starting at east (angle 0) stepping 60°."""
+    ring = []
+    for k in range(6):
+        angle = k * math.pi / 3
+        ring.append([lon + R_lon * math.cos(angle), lat + R_lat * math.sin(angle)])
+    ring.append(ring[0])  # close the ring
     return {"type": "Polygon", "coordinates": [ring]}
 
 
@@ -100,9 +112,9 @@ def _generate_mock_hex_data(
     min_lat: float, min_lon: float, max_lat: float, max_lon: float,
     osm_features: list[dict],
 ) -> list[dict]:
-    """Synthesize ~30m grid hex data with terrain attributes."""
+    """Synthesize ~30m flat-top hex grid with terrain attributes (odd-r offset)."""
     mid_lat = (min_lat + max_lat) / 2
-    dlat, dlon = _deg_per_cell(mid_lat)
+    dlat_step, dlon_step, R_lat, R_lon = _hex_steps(mid_lat)
 
     # Build OSM lookup structures
     trail_coords_list = []
@@ -122,10 +134,12 @@ def _generate_mock_hex_data(
             building_polys.append(geom)
 
     cells: list[dict] = []
-    lat = min_lat + dlat / 2
-    while lat < max_lat:
-        lon = min_lon + dlon / 2
-        while lon < max_lon:
+    col = 0
+    lon = min_lon + R_lon  # start one radius in so the leftmost vertex is at min_lon
+    while lon < max_lon:
+        row_offset = (dlat_step / 2) if (col % 2 == 1) else 0.0
+        lat = min_lat + R_lat + row_offset
+        while lat < max_lat:
             frac_lat = (lat - min_lat) / max((max_lat - min_lat), 1e-9)
             frac_lon = (lon - min_lon) / max((max_lon - min_lon), 1e-9)
             slope = 25.0 * (frac_lat + frac_lon) / 2.0
@@ -140,10 +154,10 @@ def _generate_mock_hex_data(
             else:
                 cover = "mixed"
 
-            cell_min_lat = lat - dlat / 2
-            cell_max_lat = lat + dlat / 2
-            cell_min_lon = lon - dlon / 2
-            cell_max_lon = lon + dlon / 2
+            cell_min_lat = lat - R_lat
+            cell_max_lat = lat + R_lat
+            cell_min_lon = lon - R_lon
+            cell_max_lon = lon + R_lon
 
             has_trail = any(
                 _linestring_intersects_cell_bbox(tc, cell_min_lat, cell_min_lon, cell_max_lat, cell_max_lon)
@@ -159,7 +173,7 @@ def _generate_mock_hex_data(
             cells.append({
                 "center_lat": lat,
                 "center_lon": lon,
-                "poly_geojson": _cell_polygon(lat, lon, dlat, dlon),
+                "poly_geojson": _hex_polygon(lat, lon, R_lat, R_lon),
                 "center_elev_m": round(elev, 1),
                 "slope_deg": round(slope, 2),
                 "dominant_cover": cover,
@@ -168,8 +182,9 @@ def _generate_mock_hex_data(
                 "is_building": is_building,
                 "is_water": is_water,
             })
-            lon += dlon
-        lat += dlat
+            lat += dlat_step
+        lon += dlon_step
+        col += 1
     return cells
 
 
@@ -257,19 +272,24 @@ def _fetch_real(
     }
 
     mid_lat = (min_lat + max_lat) / 2
-    dlat, dlon = _deg_per_cell(mid_lat)
+    dlat_step, dlon_step, R_lat, R_lon = _hex_steps(mid_lat)
 
-    # --- Build grid of centroid points ---
+    # --- Build grid of flat-top hex centroid points (odd-r offset, column-major) ---
     lat_steps: list[float] = []
     lon_steps: list[float] = []
-    lat = min_lat + dlat / 2
-    while lat < max_lat:
-        lon = min_lon + dlon / 2
-        while lon < max_lon:
+    col_indices: list[int] = []  # track column for each centroid (for neighbor math)
+    col = 0
+    lon = min_lon + R_lon
+    while lon < max_lon:
+        row_offset = (dlat_step / 2) if (col % 2 == 1) else 0.0
+        lat = min_lat + R_lat + row_offset
+        while lat < max_lat:
             lat_steps.append(lat)
             lon_steps.append(lon)
-            lon += dlon
-        lat += dlat
+            col_indices.append(col)
+            lat += dlat_step
+        lon += dlon_step
+        col += 1
 
     # --- DEM via Open-Elevation ---
     elevations: list[float] = []
@@ -380,7 +400,6 @@ out geom;
             building_polys.append(geom)
 
     # Build hex_data list
-    n_cols = round((max_lon - min_lon) / dlon) if dlon > 0 else 1
     hex_data: list[dict] = []
 
     if not elevations:
@@ -391,10 +410,35 @@ out geom;
             frac_lon = (lo - min_lon) / max((max_lon - min_lon), 1e-9)
             elevations.append(50.0 + 200.0 * (frac_lat + frac_lon) / 2.0)
 
+    # Build index → elevation map keyed by (col, row_within_col) for slope lookup.
+    # Centroids were emitted column-major; within each column they are contiguous.
+    col_starts: dict[int, int] = {}
+    col_lengths: dict[int, int] = {}
+    for idx, c in enumerate(col_indices):
+        if c not in col_starts:
+            col_starts[c] = idx
+        col_lengths[c] = col_lengths.get(c, 0) + 1
+
     for idx, (la, lo, elev) in enumerate(zip(lat_steps, lon_steps, elevations)):
-        if idx + 1 < len(elevations) and idx + n_cols < len(elevations):
-            dz_lon = (elevations[idx + 1] - elev) / _CELL_SIZE_M
-            dz_lat = (elevations[idx + n_cols] - elev) / _CELL_SIZE_M
+        # Slope: compare to next centroid in same column (dlat_step apart in lat)
+        # and to a centroid in the next column (offset by ~1.5*R in lon).
+        c = col_indices[idx]
+        within = idx - col_starts[c]
+        next_in_col = idx + 1 if within + 1 < col_lengths[c] else None
+        next_col_start = col_starts.get(c + 1)
+        next_in_next_col = (
+            next_col_start + min(within, col_lengths.get(c + 1, 1) - 1)
+            if next_col_start is not None
+            else None
+        )
+        if (
+            next_in_col is not None
+            and next_in_next_col is not None
+            and next_in_col < len(elevations)
+            and next_in_next_col < len(elevations)
+        ):
+            dz_lat = (elevations[next_in_col] - elev) / _CELL_SIZE_M
+            dz_lon = (elevations[next_in_next_col] - elev) / (1.5 * _CELL_SIZE_M / math.sqrt(3.0))
             slope = math.degrees(math.atan(math.sqrt(dz_lon**2 + dz_lat**2)))
         else:
             slope = 0.0
@@ -408,10 +452,10 @@ out geom;
         else:
             cover = "mixed"
 
-        cell_min_lat = la - dlat / 2
-        cell_max_lat = la + dlat / 2
-        cell_min_lon = lo - dlon / 2
-        cell_max_lon = lo + dlon / 2
+        cell_min_lat = la - R_lat
+        cell_max_lat = la + R_lat
+        cell_min_lon = lo - R_lon
+        cell_max_lon = lo + R_lon
 
         has_trail = any(
             _linestring_intersects_cell_bbox(tc, cell_min_lat, cell_min_lon, cell_max_lat, cell_max_lon)
@@ -427,7 +471,7 @@ out geom;
         hex_data.append({
             "center_lat": la,
             "center_lon": lo,
-            "poly_geojson": _cell_polygon(la, lo, dlat, dlon),
+            "poly_geojson": _hex_polygon(la, lo, R_lat, R_lon),
             "center_elev_m": round(float(elev), 1),
             "slope_deg": round(slope, 2),
             "dominant_cover": cover,
