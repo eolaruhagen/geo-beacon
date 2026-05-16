@@ -10,14 +10,17 @@ them stays valid once the agent comes online.
 from __future__ import annotations
 
 import logging
+import os
+import sqlite3
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import current_user
-from api.db import session
+from api.db import db_path, session
 from api.schemas import ActiveDispatch, SweepType
 import api.db.dispatches as db_dispatches
 import api.db.missions as db_missions
@@ -126,3 +129,46 @@ async def debug_dispatch(
     if row is None:
         raise HTTPException(status_code=500, detail="Dispatch insert succeeded but row not found")
     return ActiveDispatch.model_validate(row)
+
+
+SNAPSHOT_DIR = Path(os.environ.get("MISSION_SNAPSHOT_DIR", "/tmp/geo-beacon-snapshots"))
+
+
+class SnapshotResponse(BaseModel):
+    path: str
+    bytes: int
+    ts: int
+
+
+@router.post("/snapshot", response_model=SnapshotResponse, status_code=201)
+async def debug_snapshot(
+    caller: dict = Depends(current_user),
+) -> SnapshotResponse:
+    """Snapshot the live SQLite DB to /tmp for demo rollbacks.
+
+    Uses sqlite3's online backup API, which is safe under WAL while readers
+    and writers are active. The output is a single self-contained .db file
+    (no separate -wal/-shm) named with the unix timestamp, so re-running
+    yields a fresh file rather than overwriting the last snapshot.
+    """
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    dest_path = SNAPSHOT_DIR / f"mission-{ts}.db"
+
+    src_path = db_path()
+    src_conn = sqlite3.connect(src_path, timeout=30)
+    try:
+        dest_conn = sqlite3.connect(str(dest_path))
+        try:
+            src_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+    finally:
+        src_conn.close()
+
+    size_bytes = dest_path.stat().st_size
+    logger.info(
+        "snapshot written by user_id=%s: %s (%d bytes)",
+        caller["id"], dest_path, size_bytes,
+    )
+    return SnapshotResponse(path=str(dest_path), bytes=size_bytes, ts=ts)

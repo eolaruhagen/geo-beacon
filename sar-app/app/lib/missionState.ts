@@ -107,6 +107,24 @@ export type SegmentFeature = {
   };
 };
 
+// One feature per active dispatch (status in pending/acked/in_progress).
+// Geometry is the polygon of the hex_cell containing the dispatch's entry
+// point, so the client can render a per-user hex highlight without doing
+// its own point-in-polygon lookup.
+export type DispatchTargetFeature = {
+  type: 'Feature';
+  geometry: { type: 'Polygon'; coordinates: number[][][] };
+  properties: {
+    feature_type: 'dispatch_target';
+    dispatch_id: number;
+    user_id: number;
+    status: DispatchTargetStatus;
+    hex_id: number;
+  };
+};
+
+export type DispatchTargetStatus = 'pending' | 'acked' | 'in_progress';
+
 // hazards.kind CHECK in migrations/002_spatial.sql:97.
 export type HazardKind =
   | 'cliff'
@@ -154,6 +172,7 @@ export type AnyFeature =
   | TrackFeature
   | FindingFeature
   | SegmentFeature
+  | DispatchTargetFeature
   | HazardFeature
   | OSMFeature
   | {

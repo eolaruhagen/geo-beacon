@@ -10,7 +10,7 @@ import MissionHud from './components/MissionHud';
 import {
   ackDispatch,
   completeDispatch,
-  postDebugDispatch,
+  postSnapshot,
   startDispatch,
   type RouteWaypoint,
 } from './lib/api';
@@ -20,6 +20,7 @@ import { useRoute } from './lib/useRoute';
 import {
   fetchHexGrid,
   useMissionState,
+  type DispatchTargetFeature,
   type FindingFeature,
   type FindingKind,
   type HazardFeature,
@@ -51,7 +52,7 @@ export default function MissionView() {
   const [broadcastForceOpen, setBroadcastForceOpen] = useState(false);
   const [ordersForceOpen, setOrdersForceOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
-  const [debugBusy, setDebugBusy] = useState(false);
+  const [snapshotBusy, setSnapshotBusy] = useState(false);
 
   const insets = useSafeAreaInsets();
 
@@ -189,12 +190,6 @@ export default function MissionView() {
     [me?.active_dispatch, mission, runDispatchAction],
   );
 
-  // DEV: trigger /debug/dispatch against the highest-POA *unassigned* segment.
-  // This is what the real agent will do too (modulo POD/POS weighting), so
-  // it's also a sanity check on the POA math. Defined inside the component
-  // so it can read `segments` from the missionState closure below.
-  // (Function body lives after the segments memo — see onDebugDispatch.)
-
   const missionState = useMissionState(
     mission?.server_url ?? null,
     mission?.bearer_token ?? null,
@@ -304,43 +299,24 @@ export default function MissionView() {
     router.replace('/');
   }
 
-  // DEV: dispatch the caller to the highest-POA unassigned segment in the
-  // current mission. Mirrors what the real agent's dispatch_searcher skill
-  // will eventually choose. Calls POST /debug/dispatch and then refreshes
-  // /field/me so the orders card appears immediately.
-  const onDebugDispatch = useCallback(async () => {
-    if (!mission || debugBusy) return;
-    if (me?.active_dispatch) {
-      Alert.alert('Already dispatched', 'Complete or cancel the current dispatch first.');
-      return;
-    }
-    // Pick highest-POA segment with no current assignee.
-    const candidate = [...segments]
-      .filter((s) => s.properties.assigned_user_id == null)
-      .sort((a, b) => b.properties.poa - a.properties.poa)[0];
-    if (!candidate) {
-      Alert.alert('No segments available', 'All segments already have an assignee.');
-      return;
-    }
-    setDebugBusy(true);
+  // Demo helper: ask the server to checkpoint the live SQLite DB to /tmp so
+  // the demo state can be rolled back between runs. Triggered by the floating
+  // chat-style button (kept the 💬 glyph since it's already the "ping the
+  // server" affordance the user expects).
+  const onSnapshot = useCallback(async () => {
+    if (!mission || snapshotBusy) return;
+    setSnapshotBusy(true);
     try {
-      const resp = await postDebugDispatch(mission.server_url, mission.bearer_token, {
-        segment_id: candidate.properties.id,
-        instruction: `Sweep ${candidate.properties.name} (highest POA)`,
-      });
-      await refreshMe();
-      Alert.alert(
-        'Dispatched',
-        `Sent you to ${candidate.properties.name} ` +
-          `(POA ${(candidate.properties.poa * 100).toFixed(1)}%). Dispatch #${resp.id}.`,
-      );
+      const resp = await postSnapshot(mission.server_url, mission.bearer_token);
+      const kb = (resp.bytes / 1024).toFixed(1);
+      Alert.alert('Snapshot saved', `${resp.path}\n${kb} KB`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Debug dispatch failed';
-      Alert.alert('Dispatch failed', msg);
+      const msg = e instanceof Error ? e.message : 'Snapshot failed';
+      Alert.alert('Snapshot failed', msg);
     } finally {
-      setDebugBusy(false);
+      setSnapshotBusy(false);
     }
-  }, [mission, segments, me?.active_dispatch, debugBusy, refreshMe]);
+  }, [mission, snapshotBusy]);
 
   const selfUserId = mission?.user_id ?? null;
   const polygons = useMemo(() => {
@@ -519,21 +495,39 @@ export default function MissionView() {
     );
   }, [routeWaypoints]);
 
-  const dispatchTargetMarker = useMemo(() => {
-    const ad = me?.active_dispatch;
-    if (!ad || ad.entry_lat == null || ad.entry_lon == null) return null;
-    return (
-      <Marker
-        key={`dispatch-target-${ad.id}`}
-        coordinate={{ latitude: ad.entry_lat, longitude: ad.entry_lon }}
-        anchor={{ x: 0.5, y: 0.5 }}
-      >
-        <View style={s.dispatchTargetOuter}>
-          <View style={s.dispatchTargetInner} />
-        </View>
-      </Marker>
+  // Active dispatches surfaced as their containing hex_cell — server-side
+  // join in api/db/geojson.py runs ST_Contains so we can render the hex
+  // shape directly. Visible to every searcher in the mission, colored by
+  // assignee so two simultaneous dispatches read as distinct.
+  const dispatchTargetHexes = useMemo(() => {
+    if (!missionState) return null;
+    const targets = missionState.features.filter(
+      (f): f is DispatchTargetFeature => f.properties.feature_type === 'dispatch_target',
     );
-  }, [me?.active_dispatch]);
+    if (targets.length === 0) return null;
+    return targets.map((dt) => {
+      const uid = dt.properties.user_id;
+      const isSelf = uid === selfUserId;
+      const baseColor = isSelf ? SELF_TRACK_COLOR : colorForUser(uid);
+      // in_progress = bold solid; pending/acked = thinner dashed so the
+      // map distinguishes "I have it" from "I'm actively on it" the same
+      // way the legacy segment outline did.
+      const inProgress = dt.properties.status === 'in_progress';
+      return (
+        <Polygon
+          key={`dispatch-target-${dt.properties.dispatch_id}`}
+          coordinates={dt.geometry.coordinates[0].map(([lon, lat]) => ({
+            latitude: lat,
+            longitude: lon,
+          }))}
+          strokeColor={baseColor}
+          strokeWidth={inProgress ? 3 : 2}
+          lineDashPattern={inProgress ? undefined : [8, 4]}
+          fillColor={rgbaWithAlpha(baseColor, 0.18)}
+        />
+      );
+    });
+  }, [missionState, selfUserId]);
 
   const segmentLabels = useMemo(() => {
     if (segments.length === 0 || !region) return null;
@@ -618,8 +612,8 @@ export default function MissionView() {
         {segmentOutlines}
         {segmentLabels}
         {trackLines}
+        {dispatchTargetHexes}
         {routePolyline}
-        {dispatchTargetMarker}
         {searcherMarkers}
         {findingPins}
       </MapView>
@@ -660,10 +654,11 @@ export default function MissionView() {
           </View>
 
           {/* All top-right action buttons live in one column so they don't
-              fight the title pill for layout. Order: bell, clipboard, dev
-              dispatch, finding. The bell/clipboard buttons toggle the
-              banner / orders card open even when there's no data, which
-              lets you sanity-check that polling is working. */}
+              fight the title pill for layout. Order: bell, clipboard,
+              finding. The bell/clipboard buttons toggle the banner / orders
+              card open even when there's no data, which lets you sanity-
+              check that polling is working. Dispatches are now agent-only —
+              there's no self-dispatch button. */}
           <View style={s.mapctrl}>
             <ActionButton
               glyph="🔔"
@@ -678,12 +673,6 @@ export default function MissionView() {
               a11y="Toggle current orders"
             />
             <ActionButton
-              glyph={debugBusy ? '…' : '🎯'}
-              onPress={onDebugDispatch}
-              a11y="Dispatch me (dev)"
-              disabled={debugBusy}
-            />
-            <ActionButton
               glyph="🚩"
               onPress={() => setSheetOpen(true)}
               a11y="Log finding"
@@ -693,10 +682,11 @@ export default function MissionView() {
       </SafeAreaView>
 
       <Pressable
-        style={({ pressed }) => [s.fab, pressed && s.fabPressed]}
-        onPress={() => Alert.alert('Chat', 'Coming soon')}
+        style={({ pressed }) => [s.fab, pressed && s.fabPressed, snapshotBusy && { opacity: 0.6 }]}
+        onPress={onSnapshot}
+        disabled={snapshotBusy}
       >
-        <Text style={s.fabIcon}>💬</Text>
+        <Text style={s.fabIcon}>{snapshotBusy ? '…' : '💬'}</Text>
       </Pressable>
 
       <MapLegend topOffsetPx={insets.top + 60} />
@@ -1135,27 +1125,6 @@ const s = StyleSheet.create({
     fontSize: 10,
     fontWeight: '600',
     fontVariant: ['tabular-nums'],
-  },
-
-  dispatchTargetOuter: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    borderWidth: 2,
-    borderColor: '#fff',
-    backgroundColor: 'rgba(17,24,39,0.88)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    shadowOffset: { width: 0, height: 2 },
-  },
-  dispatchTargetInner: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#ffd166',
   },
 
   // .mapctrl from wireframes-v2.css:254 — top-right floating control stack.
