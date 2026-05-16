@@ -21,11 +21,17 @@ from pathlib import Path
 DEFAULT_DB_PATH = "/home/asus/sqlite/mission.db"
 DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 SPATIALITE_CANDIDATES = [
+    # Bare names — sqlite's load_extension appends OS-specific suffix.
     "mod_spatialite",
     "mod_spatialite.so",
+    "mod_spatialite.dylib",
+    # Linux (Ubuntu) explicit paths.
     "/usr/lib/aarch64-linux-gnu/mod_spatialite",
     "/usr/lib/x86_64-linux-gnu/mod_spatialite",
+    # macOS Homebrew explicit paths (Apple Silicon + Intel).
+    "/opt/homebrew/lib/mod_spatialite.dylib",
     "/opt/homebrew/lib/mod_spatialite",
+    "/usr/local/lib/mod_spatialite.dylib",
     "/usr/local/lib/mod_spatialite",
 ]
 
