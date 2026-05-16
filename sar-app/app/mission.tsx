@@ -817,8 +817,6 @@ const FINDING_COLORS: Record<FindingKind, string> = {
   subject_sighting: '#c0392b',
   subject_found: '#27ae60',
   hazard: '#d6362f',
-  note: '#5a6cf2',
-  other: '#7f8c8d',
 };
 
 // Approximates the .cell-untrav darkening from the mockup. We can't pattern-
@@ -973,7 +971,7 @@ const FindingMarker = memo(
   function FindingMarker({ finding }: { finding: FindingFeature }) {
     const [lon, lat] = finding.geometry.coordinates;
     const { kind, description, confidence, ts } = finding.properties;
-    const color = FINDING_COLORS[kind] ?? FINDING_COLORS.other;
+    const color = FINDING_COLORS[kind];
     const glyph = glyphFor(kind);
     return (
       <Marker
@@ -1028,8 +1026,6 @@ function glyphFor(kind: FindingKind): string {
     case 'subject_sighting': return '👁';
     case 'subject_found': return '✓';
     case 'hazard': return '⚠';
-    case 'note': return '•';
-    case 'other': return '·';
   }
 }
 

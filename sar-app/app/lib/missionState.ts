@@ -57,16 +57,16 @@ export type TrackFeature = {
 };
 
 // Mirrors api/schemas.py FindingKind (CHECK constraint in
-// migrations/002_spatial.sql:74). Keep in sync if the enum changes.
+// migrations/002_spatial.sql:74, narrowed in migrations/005). Keep in
+// sync if the enum changes — server rejects unknown kinds at the
+// Pydantic boundary and the DB CHECK is the last line of defense.
 export type FindingKind =
   | 'clue'
   | 'subject_found'
   | 'subject_sighting'
   | 'hazard'
   | 'footprint'
-  | 'discarded_item'
-  | 'note'
-  | 'other';
+  | 'discarded_item';
 
 export type FindingFeature = {
   type: 'Feature';

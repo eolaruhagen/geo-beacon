@@ -30,7 +30,7 @@ type Props = {
 const DEFAULT_CONFIDENCE = 0.6;
 
 const PRIMARY_KINDS: FindingKind[] = ['clue', 'footprint', 'discarded_item', 'subject_sighting'];
-const SECONDARY_KINDS: FindingKind[] = ['subject_found', 'hazard', 'note', 'other'];
+const SECONDARY_KINDS: FindingKind[] = ['subject_found', 'hazard'];
 
 const KIND_LABEL: Record<FindingKind, string> = {
   clue: 'Clue',
@@ -39,8 +39,6 @@ const KIND_LABEL: Record<FindingKind, string> = {
   subject_sighting: 'Sighting',
   subject_found: 'Subject Found',
   hazard: 'Hazard',
-  note: 'Note',
-  other: 'Other',
 };
 
 const KIND_COLOR: Record<FindingKind, string> = {
@@ -50,8 +48,6 @@ const KIND_COLOR: Record<FindingKind, string> = {
   subject_sighting: '#c0392b',
   subject_found: '#27ae60',
   hazard: '#d6362f',
-  note: '#5a6cf2',
-  other: '#7f8c8d',
 };
 
 export default function FindingSheet({
