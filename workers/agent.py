@@ -26,7 +26,6 @@ from scripts.apply_migrations import apply, DEFAULT_DB_PATH, DEFAULT_MIGRATIONS_
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TIMEOUT_SECONDS = 90
 DEFAULT_PARALLELISM = 3
 
 ROUTER_SYSTEM_PROMPT = """You dispatch one search-and-rescue volunteer per call.
@@ -151,7 +150,7 @@ def _parse_decision(text: str) -> RoutingDecision:
     return RoutingDecision(int(col), int(row), reasoning[:160], "llm")
 
 
-def _invoke_llm(context: DispatchContext, timeout_seconds: int) -> tuple[RoutingDecision, str]:
+def _invoke_llm(context: DispatchContext, timeout_seconds: int | None) -> tuple[RoutingDecision, str]:
     command = _command_from_env()
     if command is None:
         raise RuntimeError(
@@ -161,7 +160,10 @@ def _invoke_llm(context: DispatchContext, timeout_seconds: int) -> tuple[Routing
 
     env = os.environ.copy()
     env.setdefault("GB_OPENCLAW_THINKING", "off")
-    env.setdefault("GB_OPENCLAW_TIMEOUT", str(timeout_seconds))
+    if timeout_seconds is not None:
+        env["GB_OPENCLAW_TIMEOUT"] = str(timeout_seconds)
+    else:
+        env.pop("GB_OPENCLAW_TIMEOUT", None)
     env["GB_OPENCLAW_SESSION_ID"] = (
         f"routing-{context.mission_id}-{context.user_id}-{int(time.time())}"
     )
@@ -242,7 +244,7 @@ def _route_one(
     context: DispatchContext,
     *,
     mode: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     dry_run: bool,
     fallback_heuristic: bool,
 ) -> RoutingResult:
@@ -379,7 +381,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--user-id", type=int, default=None)
     parser.add_argument("--max-searchers", type=int, default=0)
     parser.add_argument("--parallelism", type=int, default=int(os.environ.get("ROUTING_AGENT_PARALLELISM", DEFAULT_PARALLELISM)))
-    parser.add_argument("--timeout-seconds", type=int, default=int(os.environ.get("ROUTING_AGENT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)))
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help="Optional per-searcher LLM timeout. Defaults to no timeout.",
+    )
     parser.add_argument("--interval-seconds", type=int, default=60)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--skip-active", action="store_true", help="Do not re-route users who already have an active dispatch")

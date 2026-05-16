@@ -162,7 +162,7 @@ def main() -> int:
         user_id=None,
         max_searchers=3,
         parallelism=3,
-        timeout_seconds=30,
+        timeout_seconds=None,
         interval_seconds=60,
         loop=False,
         skip_active=False,

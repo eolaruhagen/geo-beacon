@@ -19,7 +19,6 @@ fi
 prompt="$(cat)"
 session_id="${GB_OPENCLAW_SESSION_ID:-routing-$(date +%s)}"
 thinking="${GB_OPENCLAW_THINKING:-off}"
-timeout="${GB_OPENCLAW_TIMEOUT:-90}"
 
 docker start "$container_id" >/dev/null
 docker exec -i -u sandbox \
@@ -27,15 +26,23 @@ docker exec -i -u sandbox \
   --env "ROUTING_PROMPT=$prompt" \
   --env "GB_OPENCLAW_SESSION_ID=$session_id" \
   --env "GB_OPENCLAW_THINKING=$thinking" \
-  --env "GB_OPENCLAW_TIMEOUT=$timeout" \
+  --env "GB_OPENCLAW_TIMEOUT=${GB_OPENCLAW_TIMEOUT:-}" \
   "$container_id" sh -lc '
     . /tmp/nemoclaw-proxy-env.sh >/dev/null 2>&1 || true
     export HOME=/sandbox
+    if [ -n "${GB_OPENCLAW_TIMEOUT:-}" ]; then
+      exec openclaw agent \
+        --agent main \
+        --session-id "$GB_OPENCLAW_SESSION_ID" \
+        --thinking "$GB_OPENCLAW_THINKING" \
+        --timeout "$GB_OPENCLAW_TIMEOUT" \
+        --json \
+        --message "$ROUTING_PROMPT"
+    fi
     exec openclaw agent \
       --agent main \
       --session-id "$GB_OPENCLAW_SESSION_ID" \
       --thinking "$GB_OPENCLAW_THINKING" \
-      --timeout "$GB_OPENCLAW_TIMEOUT" \
       --json \
       --message "$ROUTING_PROMPT"
   '
