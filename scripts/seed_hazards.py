@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Derive structural hazards from OSM features + hex_cells at mission init.
 
-Sources:
-  - osm_features kind='water'    → hazard kind='water',  severity='critical'
-  - osm_features kind='road'     → kind='other', 'caution', buffered 5m
-  - osm_features kind='building' → kind='other', 'caution', buffered 2m
-  - hex_cells.slope_deg >= 30    → kind='cliff', severity='caution'
+Hazards are areas that are *risky to enter*. They penalize segment POA
+(critical → ×0, caution → ×0.3) and set flag_danger on intersecting hexes.
 
-After inserting hazards, rasterizes each to hex_cells.flag_danger.
-Also sets is_water=1 / is_building=1 on hex_cells inside water/building OSM polygons.
+Sources:
+  - osm_features kind='water'    → hazard kind='water', severity='critical'  (drowning)
+  - hex_cells.slope_deg >= 30    → kind='cliff',        severity='caution'   (fall risk)
+
+Buildings and roads are intentionally NOT hazards. They're descriptive — a
+building isn't risky to walk near, and a road corridor isn't dangerous to
+search around. They're surfaced via the feature-type flags has_road and
+is_building (set on hex_cells), which renderers can style differently without
+ever entering the POA penalty / flag_danger path.
+
+After inserting hazards, rasterizes each to hex_cells.flag_danger. Also sets
+is_water=1 and is_building=1 on hex_cells inside water/building OSM polygons
+(feature-type flags only — no POA impact for buildings).
 
 Idempotent: deletes existing hazards and resets hex_cells flags before re-deriving.
 
@@ -20,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 
@@ -33,23 +40,6 @@ from api.db.hex_cells import rasterize_hazard_to_hex_flags
 log = logging.getLogger("seed_hazards")
 
 CLIFF_SLOPE_DEG = 30.0
-ROAD_BUFFER_M = 5.0
-BUILDING_BUFFER_M = 2.0
-
-
-def _buffer_deg(lat: float, meters: float) -> float:
-    deg_per_meter_lat = 1.0 / 111_320.0
-    deg_per_meter_lon = 1.0 / (111_320.0 * max(0.1, math.cos(math.radians(lat))))
-    return meters * (deg_per_meter_lat + deg_per_meter_lon) / 2
-
-
-def _mission_centroid_lat(mission_id: int) -> float:
-    with session() as conn:
-        row = conn.execute(
-            "SELECT Y(Centroid(area_geom)) AS lat FROM missions WHERE id = ?",
-            (mission_id,),
-        ).fetchone()
-        return float(row["lat"]) if row and row["lat"] is not None else 37.0
 
 
 def _explode_to_polygons(geom: dict) -> list[dict]:
@@ -64,11 +54,11 @@ def _explode_to_polygons(geom: dict) -> list[dict]:
 def seed_hazards(mission_id: int) -> dict[str, int]:
     """Insert structural hazards, rasterize to hex_cells, set feature-type flags.
 
-    Returns counts {water, road, building, cliff, total_hazards,
+    Returns counts {water, cliff, total_hazards,
                     hexes_flagged_danger, hexes_flagged_water, hexes_flagged_building}.
     """
     counts = {
-        "water": 0, "road": 0, "building": 0, "cliff": 0,
+        "water": 0, "cliff": 0,
         "total_hazards": 0,
         "hexes_flagged_danger": 0,
         "hexes_flagged_water": 0,
@@ -82,10 +72,6 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
             "UPDATE hex_cells SET flag_danger=0, is_water=0, is_building=0 WHERE mission_id=?",
             (mission_id,),
         )
-
-    centroid_lat = _mission_centroid_lat(mission_id)
-    road_buf = _buffer_deg(centroid_lat, ROAD_BUFFER_M)
-    bldg_buf = _buffer_deg(centroid_lat, BUILDING_BUFFER_M)
 
     rows: list[dict] = []
 
@@ -108,41 +94,13 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
                 })
                 counts["water"] += 1
 
-        # Road → caution 'other' hazards (buffered)
-        road_rows = conn.execute(
-            "SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj FROM osm_features WHERE mission_id=? AND kind='road'",
-            (road_buf, mission_id),
-        ).fetchall()
-        for r in road_rows:
-            gj = json.loads(r["gj"]) if r["gj"] else None
-            if not gj:
-                continue
-            for poly in _explode_to_polygons(gj):
-                rows.append({
-                    "kind": "other",
-                    "severity": "caution",
-                    "description": f"Road corridor: {r['name'] or 'unnamed'} — vehicle traffic",
-                    "poly_geojson": poly,
-                })
-                counts["road"] += 1
-
-        # Building → caution 'other' hazards (buffered)
-        bldg_rows = conn.execute(
-            "SELECT name, AsGeoJSON(ST_Buffer(geom, ?)) AS gj FROM osm_features WHERE mission_id=? AND kind='building'",
-            (bldg_buf, mission_id),
-        ).fetchall()
-        for b in bldg_rows:
-            gj = json.loads(b["gj"]) if b["gj"] else None
-            if not gj:
-                continue
-            for poly in _explode_to_polygons(gj):
-                rows.append({
-                    "kind": "other",
-                    "severity": "caution",
-                    "description": f"Structure: {b['name'] or 'unnamed'} — impassable / private",
-                    "poly_geojson": poly,
-                })
-                counts["building"] += 1
+        # Roads and buildings are NOT inserted as hazards. They're feature-type
+        # information surfaced via has_road / is_building flags on hex_cells
+        # (set elsewhere — has_road in fetch_terrain.py, is_building below).
+        # A building or road corridor isn't *risky to enter*; treating them as
+        # caution hazards used to zero ~70% of POA off any segment that
+        # clipped a structure or road, which doesn't match the actual SAR
+        # search model.
 
         # Steep hex_cells → cliff hazards (per cell, fall back to per-cell if component logic is hard)
         cliff_rows = conn.execute(
@@ -209,10 +167,10 @@ def seed_hazards(mission_id: int) -> dict[str, int]:
         counts["hexes_flagged_building"] = building_result.rowcount
 
     log.info(
-        "Seeded hazards for mission %d: water=%d road=%d building=%d cliff=%d "
-        "(total=%d) flagged_danger=%d flagged_water=%d flagged_building=%d",
+        "Seeded hazards for mission %d: water=%d cliff=%d (total=%d) "
+        "flagged_danger=%d flagged_water=%d flagged_building=%d",
         mission_id,
-        counts["water"], counts["road"], counts["building"], counts["cliff"],
+        counts["water"], counts["cliff"],
         counts["total_hazards"],
         counts["hexes_flagged_danger"],
         counts["hexes_flagged_water"],
