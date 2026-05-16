@@ -13,6 +13,7 @@ from api.db.hazards import bulk_insert_hazards
 from api.db.hex_cells import (
     hex_cell_id_at,
     hex_cells_for_mission,
+    mark_hex_searched,
     rasterize_hazard_to_hex_flags,
     set_flag_clue_for_hex,
 )
@@ -53,6 +54,16 @@ async def field_ping(
         battery_pct=body.battery_pct,
         source="phone",
     )
+
+    # Auto-mark-searched: tag the containing hex as covered. Best-effort —
+    # a PIP or UPDATE failure here must NOT fail the ping itself.
+    try:
+        hex_id = hex_cell_id_at(mission_id, body.lat, body.lon)
+        if hex_id is not None:
+            mark_hex_searched(hex_id, user["id"], ts)
+    except Exception as e:
+        logger.error("hex coverage update failed for ping %s: %s", ping_id, e)
+
     return PingResponse(ping_id=ping_id)
 
 

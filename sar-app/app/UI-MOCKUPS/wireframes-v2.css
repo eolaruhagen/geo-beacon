@@ -1,0 +1,341 @@
+/* OpenSAR wireframes v2 — clean vector, iOS-native vibe (still wireframes, not polish) */
+
+:root {
+  --ink: #0b0b0c;
+  --ink-2: #3c3c43;
+  --ink-3: #6b6b73;
+  --ink-4: #a3a3aa;
+  --hair: rgba(60,60,67,0.18);
+  --hair-2: rgba(60,60,67,0.10);
+  --panel: #ffffff;
+  --panel-2: #f6f6f6;
+  --bg: #eef0f2;
+
+  /* Apple-maps-ish neutral palette for the wireframe backdrop */
+  --map-land: #f0ece1;
+  --map-park: #d8e3cc;
+  --map-water: #b9d5ea;
+  --map-road: #ffffff;
+  --map-road-line: #d6d2c4;
+
+  --accent: #d6362f;   /* SAR red */
+  --accent-2: #aa241e;
+  --blue: #2b6cf6;
+  --blue-soft: rgba(43,108,246,0.18);
+
+  --sf: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  --sf-disp: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", system-ui, sans-serif;
+  --sf-mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.wf2 {
+  font-family: var(--sf);
+  color: var(--ink);
+  font-size: 13px;
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background: var(--map-land);
+  -webkit-font-smoothing: antialiased;
+}
+.wf2 * { box-sizing: border-box; }
+
+/* Status bar */
+.sb {
+  position: absolute; top: 0; left: 0; right: 0; height: 44px;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 22px;
+  font-family: var(--sf-disp);
+  font-size: 15px; font-weight: 600;
+  color: var(--ink); z-index: 50;
+}
+.sb .icons { display: flex; gap: 5px; align-items: center; }
+.sb .icons svg { display: block; }
+
+/* Home indicator */
+.hi {
+  position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%);
+  width: 124px; height: 4px; border-radius: 2px;
+  background: rgba(0,0,0,0.85); z-index: 50;
+}
+
+/* Map backdrop — clean wireframe Apple-Maps-ish */
+.map {
+  position: absolute; inset: 0;
+  background: var(--map-land);
+  overflow: hidden;
+}
+.map .road {
+  position: absolute; background: var(--map-road);
+  box-shadow: 0 0 0 0.5px var(--map-road-line);
+}
+.map .park {
+  position: absolute; background: var(--map-park);
+}
+.map .water {
+  position: absolute; background: var(--map-water);
+}
+.map .label {
+  position: absolute;
+  font-family: var(--sf);
+  font-size: 10px;
+  color: rgba(60,60,67,0.55);
+  letter-spacing: 0.2px;
+}
+
+/* Top floating pill — refined Option A */
+.toppill {
+  position: absolute;
+  top: 54px; left: 12px; right: 12px;
+  height: 50px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 0.5px solid rgba(255,255,255,0.6);
+  box-shadow:
+    0 0.5px 0 rgba(255,255,255,0.9) inset,
+    0 1px 2px rgba(0,0,0,0.06),
+    0 6px 18px rgba(0,0,0,0.08);
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  align-items: center;
+  padding: 0 14px 0 6px;
+  z-index: 40;
+}
+.toppill .x {
+  width: 32px; height: 32px; margin-left: 6px;
+  border-radius: 16px;
+  background: rgba(120,120,128,0.16);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-2);
+}
+.toppill .title {
+  display: flex; flex-direction: column; align-items: center; line-height: 1.05;
+}
+.toppill .title .name {
+  font-family: var(--sf-disp);
+  font-size: 15px; font-weight: 600; color: var(--ink);
+}
+.toppill .title .sub {
+  font-size: 11px; color: var(--ink-3); margin-top: 2px;
+  display: flex; align-items: center; gap: 4px;
+}
+.toppill .title .sub .dot {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+}
+.toppill .callsign {
+  font-size: 13px; color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+
+/* Chat FAB — centered, glass */
+.fab2 {
+  position: absolute;
+  bottom: 36px; left: 50%; transform: translateX(-50%);
+  width: 56px; height: 56px; border-radius: 28px;
+  background: rgba(255,255,255,0.78);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 0.5px solid rgba(255,255,255,0.6);
+  box-shadow:
+    0 0.5px 0 rgba(255,255,255,0.9) inset,
+    0 1px 2px rgba(0,0,0,0.06),
+    0 8px 24px rgba(0,0,0,0.12);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 40;
+}
+.fab2 .badge {
+  position: absolute; top: -2px; right: -2px;
+  min-width: 20px; height: 20px; padding: 0 6px;
+  border-radius: 10px; background: var(--accent); color: #fff;
+  font-size: 11px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid #fff;
+  font-variant-numeric: tabular-nums;
+}
+
+/* User blue dot — Apple style */
+.blue {
+  position: absolute; width: 18px; height: 18px;
+  border-radius: 50%; background: var(--blue);
+  border: 2.5px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.06), 0 2px 6px rgba(43,108,246,0.35);
+}
+.blue::before {
+  content: ''; position: absolute; inset: -14px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(43,108,246,0.25), rgba(43,108,246,0) 70%);
+  z-index: -1;
+}
+
+/* Volunteer dots — gray, smaller, with callsign label option */
+.vol {
+  position: absolute; width: 12px; height: 12px;
+  border-radius: 50%; background: #fff;
+  border: 1.5px solid var(--ink-2);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+}
+
+/* Native-feeling MKAnnotation-style pin */
+.mkpin {
+  position: absolute;
+  width: 28px; height: 36px;
+  transform: translate(-50%, -100%);
+}
+.mkpin .head {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.25);
+  display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 13px; font-weight: 600;
+}
+.mkpin .stem {
+  position: absolute; left: 50%; bottom: 0;
+  width: 2px; height: 10px; background: var(--accent);
+  transform: translateX(-50%);
+  border-radius: 1px;
+}
+.mkpin .stem::after {
+  content: ''; position: absolute; left: 50%; bottom: -3px;
+  width: 4px; height: 4px; border-radius: 50%;
+  background: rgba(0,0,0,0.25);
+  transform: translateX(-50%);
+  filter: blur(1px);
+}
+
+/* Pin variants */
+.mkpin.done .head { background: #34a853; }
+.mkpin.done .stem { background: #34a853; }
+
+/* Path line from user to active waypoint — dashed accent */
+.pathline {
+  position: absolute; inset: 0; pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Search grid overlay
+   The grid is 15m × 15m subcells. Rendered as SVG so cell
+   states can be drawn precisely over the map.
+   ───────────────────────────────────────────────────────────── */
+
+.grid-wrap { position: absolute; inset: 0; pointer-events: none; }
+.cell-base { fill: transparent; stroke: rgba(11,11,12,0.22); stroke-width: 0.5; }
+.cell-searched { fill: rgba(43,108,246,0.18); stroke: rgba(43,108,246,0.40); stroke-width: 0.5; }
+.cell-untrav-base { fill: rgba(11,11,12,0.10); stroke: rgba(11,11,12,0.30); stroke-width: 0.5; }
+.cell-untrav   { fill: url(#hatch-untrav); stroke: rgba(11,11,12,0.30); stroke-width: 0.5; }
+.cell-hint     { fill: rgba(48,158,76,0.22); stroke: rgba(48,158,76,0.55); stroke-width: 0.75; }
+.cell-hint-edge{ fill: rgba(48,158,76,0.10); stroke: rgba(48,158,76,0.40); stroke-width: 0.5; stroke-dasharray: 2 2; }
+
+/* Legend / annotation card */
+.legend {
+  position: absolute;
+  background: rgba(255,255,255,0.94);
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  border: 0.5px solid rgba(0,0,0,0.08);
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 11px; color: var(--ink-2);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+}
+.legend .row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.legend .sw {
+  width: 18px; height: 18px; border-radius: 3px;
+  border: 0.5px solid rgba(0,0,0,0.2);
+}
+.legend .sw.searched { background: rgba(43,108,246,0.18); border-color: rgba(43,108,246,0.4); }
+.legend .sw.open     { background: transparent; }
+.legend .sw.untrav   { background: rgba(11,11,12,0.10); background-image: repeating-linear-gradient(45deg, rgba(11,11,12,0.32) 0 1.2px, transparent 1.2px 4px); border-color: rgba(11,11,12,0.35); }
+.legend .sw.hint     { background: rgba(48,158,76,0.25); border-color: rgba(48,158,76,0.55); }
+.legend .title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--ink-3); margin-bottom: 4px; }
+
+/* Map controls (compass + scale) */
+.mapctrl {
+  position: absolute; right: 12px;
+  width: 44px; border-radius: 12px;
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+  border: 0.5px solid rgba(255,255,255,0.6);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06), 0 6px 18px rgba(0,0,0,0.08);
+  display: flex; flex-direction: column; align-items: center;
+  font-size: 11px; color: var(--ink-2);
+}
+.mapctrl .btn {
+  width: 100%; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+}
+.mapctrl .btn + .btn { border-top: 0.5px solid rgba(0,0,0,0.08); }
+
+/* Callout */
+.cl {
+  position: absolute;
+  width: 240px;
+  background: rgba(255,255,255,0.94);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 0.5px solid rgba(0,0,0,0.08);
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06), 0 12px 32px rgba(0,0,0,0.16);
+  font-size: 13px; color: var(--ink);
+  z-index: 35;
+}
+.cl .eyebrow {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--accent); font-weight: 600; margin-bottom: 4px;
+}
+.cl .body { color: var(--ink-2); line-height: 1.35; }
+.cl .row { display: flex; gap: 8px; margin-top: 10px; }
+.cl .btn {
+  flex: 1; height: 32px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 500;
+  background: rgba(120,120,128,0.16); color: var(--ink);
+}
+.cl .btn.primary { background: var(--accent); color: #fff; }
+.cl::after {
+  content: ''; position: absolute; bottom: -6px; left: 28px;
+  width: 12px; height: 12px; background: rgba(255,255,255,0.94);
+  border-right: 0.5px solid rgba(0,0,0,0.08);
+  border-bottom: 0.5px solid rgba(0,0,0,0.08);
+  transform: rotate(45deg);
+}
+
+/* Chat sheet */
+.sheet2 {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  background: rgba(255,255,255,0.85);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border-top-left-radius: 14px; border-top-right-radius: 14px;
+  box-shadow: 0 -1px 2px rgba(0,0,0,0.05), 0 -12px 32px rgba(0,0,0,0.12);
+  padding: 8px 14px 30px;
+  z-index: 45;
+}
+.sheet2 .handle {
+  width: 36px; height: 5px; border-radius: 3px;
+  background: rgba(60,60,67,0.3); margin: 4px auto 10px;
+}
+
+/* Annotation labels — for callouts pointing at things in legend section */
+.note2 {
+  position: absolute;
+  font-family: var(--sf);
+  font-size: 11px;
+  color: var(--ink-2);
+  max-width: 180px;
+  line-height: 1.3;
+}
+.note2 b { color: var(--ink); font-weight: 600; }
+
+/* Section description style override (clean wireframe vibe) */
+.wf2 .h-section-note {
+  font-family: var(--sf);
+  font-size: 13px;
+  color: var(--ink-2);
+  max-width: 720px;
+}

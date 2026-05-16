@@ -42,3 +42,27 @@ async def mission_state(
         content=json.dumps(fc),
         media_type="application/geo+json",
     )
+
+
+@router.get("/{mission_id}/hex_grid.geojson")
+async def hex_grid(
+    mission_id: int,
+    user: dict = Depends(current_user),
+) -> Response:
+    mission = db_missions.get_mission(mission_id)
+    if mission is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+
+    # AUTH-1 (mirrored from /state.geojson): cross-mission read protection.
+    # Without this, any authenticated token could enumerate grids for missions
+    # the user has no relationship with.
+    is_creator = user["id"] == mission["created_by_user_id"]
+    is_member  = user.get("current_mission_id") == mission_id
+    if not (is_creator or is_member):
+        raise HTTPException(status_code=403, detail="Not a member of this mission")
+
+    fc = db_geojson.hex_grid_feature_collection(mission_id)
+    return Response(
+        content=json.dumps(fc),
+        media_type="application/geo+json",
+    )

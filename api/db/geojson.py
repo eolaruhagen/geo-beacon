@@ -39,15 +39,19 @@ def mission_state_feature_collection(mission_id: int) -> dict:
                 },
             })
 
-        # Hex cells: non-default flags only
+        # Hex cells: non-default flags only (includes flag_searched so the
+        # client can apply live coverage tints via the existing state poll).
         hex_rows = conn.execute(
             """
             SELECT id, flag_danger, flag_impassable, flag_clue, flag_poi,
-                   is_water, is_building, AsGeoJSON(geom) AS geom_json
+                   is_water, is_building,
+                   flag_searched, searched_by_user_id, searched_ts,
+                   AsGeoJSON(geom) AS geom_json
             FROM hex_cells
             WHERE mission_id = ?
               AND (flag_danger = 1 OR flag_impassable = 1 OR flag_clue = 1
-                   OR flag_poi = 1 OR is_water = 1 OR is_building = 1)
+                   OR flag_poi = 1 OR is_water = 1 OR is_building = 1
+                   OR flag_searched = 1)
             """,
             (mission_id,),
         ).fetchall()
@@ -65,13 +69,16 @@ def mission_state_feature_collection(mission_id: int) -> dict:
                     "flag_poi": row["flag_poi"],
                     "is_water": row["is_water"],
                     "is_building": row["is_building"],
+                    "flag_searched": row["flag_searched"],
+                    "searched_by_user_id": row["searched_by_user_id"],
+                    "searched_ts": row["searched_ts"],
                 },
             })
 
         # Searchers: latest ping per user as Point Feature
         searcher_rows = conn.execute(
             """
-            SELECT u.id AS user_id, u.callsign, u.status,
+            SELECT u.id AS user_id, u.callsign, u.status, u.role,
                    AsGeoJSON(p.geom) AS geom_json
             FROM users u
             JOIN pings p ON p.id = (
@@ -93,6 +100,7 @@ def mission_state_feature_collection(mission_id: int) -> dict:
                     "user_id": row["user_id"],
                     "callsign": row["callsign"],
                     "status": row["status"],
+                    "role": row["role"],
                 },
             })
 
@@ -187,4 +195,54 @@ def mission_state_feature_collection(mission_id: int) -> dict:
                 },
             })
 
+    return {"type": "FeatureCollection", "features": features}
+
+
+def hex_grid_feature_collection(mission_id: int) -> dict:
+    """All hex cells for a mission as a static GeoJSON FeatureCollection.
+
+    Unlike mission_state_feature_collection, this returns every cell (not just
+    flagged ones) so the client can render the full grid overlay. Properties
+    carry terrain + flag bits for client-side styling.
+    """
+    # TODO(phase3): when flags start mutating, support If-Modified-Since against
+    # MAX(flags_updated_ts) per mission so the client can revalidate cheaply.
+    features = []
+    with session() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, segment_id, center_elev_m, slope_deg, dominant_cover,
+                   has_trail, has_road, is_water, is_building,
+                   flag_danger, flag_impassable, flag_clue, flag_poi,
+                   flag_searched, searched_by_user_id, searched_ts,
+                   AsGeoJSON(geom) AS geom_json
+            FROM hex_cells WHERE mission_id = ?
+            """,
+            (mission_id,),
+        ).fetchall()
+        for row in rows:
+            geom = json.loads(row["geom_json"]) if row["geom_json"] else None
+            features.append({
+                "type": "Feature",
+                "geometry": geom,
+                "properties": {
+                    "feature_type": "hex_cell",
+                    "id": row["id"],
+                    "segment_id": row["segment_id"],
+                    "center_elev_m": row["center_elev_m"],
+                    "slope_deg": row["slope_deg"],
+                    "dominant_cover": row["dominant_cover"],
+                    "has_trail": row["has_trail"],
+                    "has_road": row["has_road"],
+                    "is_water": row["is_water"],
+                    "is_building": row["is_building"],
+                    "flag_danger": row["flag_danger"],
+                    "flag_impassable": row["flag_impassable"],
+                    "flag_clue": row["flag_clue"],
+                    "flag_poi": row["flag_poi"],
+                    "flag_searched": row["flag_searched"],
+                    "searched_by_user_id": row["searched_by_user_id"],
+                    "searched_ts": row["searched_ts"],
+                },
+            })
     return {"type": "FeatureCollection", "features": features}

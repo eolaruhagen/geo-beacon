@@ -142,20 +142,79 @@ DB Browser supports via Preferences → SQL extension to load.
 
 ---
 
-## Phone testing recipe
+## Phone testing
 
-1. `./dev/run-api.sh` in terminal 1
-2. `./dev/run-ngrok.sh` in terminal 2
-3. Copy the `https://...ngrok-free.app` URL
-4. On your iPhone, edit your Shortcut to POST to that URL + path (e.g.
-   `https://abc-xyz.ngrok-free.app/field/ping`) with your test payload
-5. Run the Shortcut, watch the uvicorn terminal for the request log
-6. `sqlite3 dev/data/mission.db "SELECT * FROM pings ORDER BY ts DESC LIMIT 1"`
-   to confirm the row landed
+1. Start the server: `./dev/run-api.sh`
+2. In another terminal: `ngrok http 8000` (or `./dev/run-ngrok.sh`)
+3. Copy the `https://` URL into the phone app's Server URL field.
+4. Seed a mission: `python scripts/seed_mission.py` (run from the repo root with the venv active)
+5. Share the printed `join_code` with each phone.
 
-If the request never reaches uvicorn, check: ngrok dashboard at
-http://localhost:4040 shows every request that hit the tunnel — useful for
-debugging headers / payload shape without re-running the Shortcut blindly.
+ngrok dashboard at http://localhost:4040 shows every request that hit the
+tunnel — useful for debugging headers / payload shape without re-running the
+phone blindly.
+
+---
+
+## Phone dev — running sar-app on a real iPhone
+
+Two URLs that look the same but serve different things. Keep them straight:
+
+| URL | What it is | Where it goes |
+|---|---|---|
+| `https://*.exp.direct` | **Metro tunnel** — serves the JS bundle to the dev client | Dev-client launch screen / QR you scan |
+| `https://*.ngrok-free.app` | **API tunnel** — serves FastAPI | Mission Selector "Server URL" field in the app |
+
+### First-time / after native changes
+
+Native rebuild is required when you add a native package, change `app.json` plugins, change `Info.plist` keys, or run `prebuild --clean`.
+
+```bash
+cd sar-app
+npx expo install <new-native-package>      # if adding a package
+npx expo prebuild -p ios --clean           # if app.json native config changed
+npx expo run:ios --device                  # builds, installs, starts Metro
+```
+
+### Daily JS-only loop
+
+```bash
+cd sar-app
+npx expo start --dev-client --tunnel       # tunnel = required on eduroam / any wifi with client isolation
+```
+
+`--tunnel` needs `@expo/ngrok`. If Metro complains about it, install it **as a project dependency** (Expo CLI doesn't reliably pick up the global install on macOS):
+
+```bash
+npm install --save-dev @expo/ngrok
+```
+
+After `Tunnel ready.` prints in the terminal, **scan the QR with the iPhone Camera app**, not from inside the app. Don't tap the home-screen icon to launch — it'll try the cached LAN URL and fail.
+
+### Wiring the phone to the API
+
+1. Metro tunnel terminal (`expo start --dev-client --tunnel`) — leave running.
+2. API terminal: `./dev/run-api.sh`
+3. API tunnel terminal: `ngrok http 8000` — copy the `https://*.ngrok-free.app` URL.
+4. Seed a mission: `python scripts/seed_mission.py` — note the `join_code`.
+5. On the phone: app opens to Mission Selector. Paste the **ngrok API URL** into the Server URL field. Enter display name + join code. Tap Join.
+
+### Common failure modes
+
+**`No script URL provided — unsanitizedScriptURLString = (null)`**
+The dev-client launched without a bundler URL. You tapped the icon instead of scanning the QR, or the cached URL is stale. Force-close the app, scan the QR via Camera.
+
+**`The resource could not be loaded because the App Transport Security policy requires the use of a secure connection.`**
+The dev-client is trying `http://<lan-ip>:8081` (insecure HTTP + unreachable LAN). You're not on the tunnel — scanned the wrong QR or hit a cached URL. Stop Metro, restart with `--tunnel --clear`, scan the fresh QR.
+
+**Multiple Metro instances running**
+The dev-client may pick up the wrong one. Kill all of them (`pkill -f "expo start"`) before restarting.
+
+**ngrok dashboard shows `HEAD /` / `GET /` returning 404**
+Not an error. FastAPI has no route at `/`. Real endpoints (`/missions/join`, `/field/ping`, etc.) return 2xx.
+
+**Eduroam / coffeeshop wifi blocks Metro entirely**
+Most public/institutional wifi networks have client isolation — phones can't reach laptops on the same SSID. `--tunnel` bypasses this. If the tunnel is also flaky, fall back to a phone-hotspot SSID (Mac joins phone's hotspot, both devices share that private network).
 
 ---
 

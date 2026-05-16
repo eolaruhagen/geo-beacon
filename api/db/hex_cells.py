@@ -105,3 +105,21 @@ def set_flag_clue_for_hex(hex_id: int) -> None:
             "UPDATE hex_cells SET flag_clue = 1, flags_updated_ts = ? WHERE id = ?",
             (now, hex_id),
         )
+
+
+def mark_hex_searched(hex_id: int, user_id: int, ts: int) -> None:
+    """Mark a hex cell as covered by a searcher's ping. Idempotent at the
+    cell level — repeated calls update searched_by_user_id and searched_ts
+    (last-writer-wins) but flag_searched stays set.
+    """
+    with session() as conn:
+        conn.execute(
+            """
+            UPDATE hex_cells
+            SET flag_searched = 1,
+                searched_by_user_id = ?,
+                searched_ts = ?
+            WHERE id = ?
+            """,
+            (user_id, ts, hex_id),
+        )

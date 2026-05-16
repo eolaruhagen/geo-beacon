@@ -42,11 +42,13 @@ echo
 
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
+RELOAD_ARGS=(--reload)
+for d in api workers agent; do
+  [[ -d "$REPO_ROOT/$d" ]] && RELOAD_ARGS+=(--reload-dir "$REPO_ROOT/$d")
+done
+
 exec uvicorn "$APP_MODULE" \
   --host "$HOST" \
   --port "$PORT" \
   --log-level "$LOG_LEVEL" \
-  --reload \
-  --reload-dir "$REPO_ROOT/api" \
-  --reload-dir "$REPO_ROOT/workers" \
-  --reload-dir "$REPO_ROOT/agent"
+  "${RELOAD_ARGS[@]}"
