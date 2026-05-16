@@ -4,8 +4,10 @@ Run on the DGX from the repo root:
 
     python -m agent.mcp_server
 
-OpenClaw should connect to this process over stdio. The actual mission logic is
-in `agent.skills.read` and `agent.skills.write`; this file is only the adapter.
+OpenClaw can connect to this process over stdio. Trimmed down after the
+§10 Mission Brief loop and commander-grade skills were deprecated. The
+routing agent runs in-process (see docs/2026-05-16-dispatch-agent.md) and
+does not use MCP; what's exposed here is a thin debug surface only.
 """
 from __future__ import annotations
 
@@ -20,25 +22,13 @@ SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
 
 
 def _register_tools(mcp) -> None:
-    # Read tools.
-    mcp.tool()(read.get_mission_brief)
-    mcp.tool()(read.get_mission_overview)
-    mcp.tool()(read.get_segment)
+    # Read tools (debug surface).
     mcp.tool()(read.get_searcher)
     mcp.tool()(read.get_findings)
-    mcp.tool()(read.get_terrain_summary)
-    mcp.tool()(read.get_uncovered_areas)
-    mcp.tool()(read.query_route)
     mcp.tool()(read.recent_events)
 
     # Write tools.
     mcp.tool()(write.dispatch_searcher)
-    mcp.tool()(write.reassign_searcher)
-    mcp.tool()(write.recall_searcher)
-    mcp.tool()(write.broadcast)
-    mcp.tool()(write.flag_hazard)
-    mcp.tool()(write.update_segment_poa)
-    mcp.tool()(write.update_mission_status)
 
 
 def _env_int(name: str, default: int) -> int:

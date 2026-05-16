@@ -1,8 +1,8 @@
 """Read-only agent skills for geo-beacon.
 
-These functions are the agent's safe view of mission state. They summarize the
-SQLite/SpatiaLite database at the segment/searcher level and deliberately avoid
-exposing raw SQL or the full hex grid to the model.
+These functions are the agent's safe view of mission state. They are the
+surviving subset after the §10 Mission Brief loop was deprecated in favor of
+the per-volunteer routing agent (see docs/2026-05-16-routing-agent.md).
 """
 from __future__ import annotations
 
@@ -11,17 +11,14 @@ import time
 from typing import Any
 
 from api.db import session
-import api.db.dispatches as db_dispatches
 import api.db.missions as db_missions
-import api.db.pings as db_pings
-from api.db.routing import snap_point_to_nearest_trail
 
 
 ACTIVE_DISPATCH_STATUSES = ("pending", "acked", "in_progress")
 
 
 # Measures the distance between two GPS dots.
-# This helps us summarize how far a searcher walked.
+# Used by surviving callers (sim/debug) and by the routing pre-compute.
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6_371_000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -56,9 +53,9 @@ def _resolve_mission_id(mission_id: int | None = None) -> int:
 
 
 # Lists the missions that are currently running.
-# The worker uses this so it knows which missions the agent should think about.
+# Used by the routing-agent worker to know which missions to loop over.
 def active_missions() -> list[dict[str, Any]]:
-    """Return active missions, newest first. Used by the worker runner."""
+    """Return active missions, newest first."""
     with session() as conn:
         rows = conn.execute(
             """
@@ -70,46 +67,6 @@ def active_missions() -> list[dict[str, Any]]:
             """
         ).fetchall()
     return [dict(row) for row in rows]
-
-
-# Gives the agent the big picture of one mission.
-# It counts searchers, segments, and overall progress.
-def get_mission_overview(mission_id: int | None = None) -> dict[str, Any]:
-    """Return top-level mission counts and status."""
-    mid = _resolve_mission_id(mission_id)
-    with session() as conn:
-        row = conn.execute(
-            """
-            SELECT m.id, m.name, m.status, m.subject_description,
-                   m.pls_lat, m.pls_lon, m.pls_ts, m.started_ts, m.ended_ts,
-                   COALESCE((
-                     SELECT COUNT(*) FROM users u
-                     WHERE u.current_mission_id = m.id AND u.role = 'searcher'
-                   ), 0) AS total_searchers,
-                   COALESCE((
-                     SELECT COUNT(*) FROM users u
-                     WHERE u.current_mission_id = m.id
-                       AND u.role = 'searcher'
-                       AND u.status IN ('dispatched', 'on_segment', 'returning')
-                   ), 0) AS active_searchers,
-                   COALESCE((
-                     SELECT COUNT(*) FROM segments s WHERE s.mission_id = m.id
-                   ), 0) AS total_segments,
-                   COALESCE((
-                     SELECT COUNT(*) FROM segments s
-                     WHERE s.mission_id = m.id AND s.status IN ('swept', 'cleared')
-                   ), 0) AS swept_segments,
-                   COALESCE((
-                     SELECT SUM(pos) FROM segments s WHERE s.mission_id = m.id
-                   ), 0) AS cumulative_pos
-            FROM missions m
-            WHERE m.id = ?
-            """,
-            (mid,),
-        ).fetchone()
-    if row is None:
-        raise ValueError(f"Mission {mid} not found")
-    return dict(row)
 
 
 # Shows who is in the mission and what each person is doing.
@@ -235,68 +192,8 @@ def get_searcher(id_or_callsign: int | str, mission_id: int | None = None) -> di
     return target
 
 
-# Looks up one map segment by id or name.
-# It tells the agent what is there, who is assigned, and what hazards touch it.
-def get_segment(id_or_name: int | str, mission_id: int | None = None) -> dict[str, Any]:
-    """Return a segment summary plus intersecting hazards and active assignments."""
-    mid = _resolve_mission_id(mission_id)
-    needle = str(id_or_name).strip()
-    if needle.isdigit():
-        where = "s.id = ?"
-        params: tuple[Any, ...] = (int(needle), mid)
-    else:
-        where = "s.name = ?"
-        params = (needle, mid)
-
-    with session() as conn:
-        row = conn.execute(
-            f"""
-            SELECT s.id, s.mission_id, s.name, s.area_m2, s.poa, s.pod, s.pos,
-                   s.status, s.assigned_user_id, s.sweep_type, s.target_pod,
-                   s.avg_slope_deg, s.dominant_cover, s.trail_length_m,
-                   X(Centroid(s.geom)) AS center_lon,
-                   Y(Centroid(s.geom)) AS center_lat
-            FROM segments s
-            WHERE {where} AND s.mission_id = ?
-            """,
-            params,
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"Segment {id_or_name!r} not found in mission {mid}")
-
-        hazards = conn.execute(
-            """
-            SELECT h.id, h.kind, h.severity, h.description, h.created_ts, h.expires_ts
-            FROM hazards h, segments s
-            WHERE s.id = ? AND h.mission_id = ?
-              AND ST_Intersects(s.geom, h.geom)
-            ORDER BY h.severity DESC, h.created_ts DESC
-            """,
-            (row["id"], mid),
-        ).fetchall()
-        dispatches = conn.execute(
-            """
-            SELECT d.id, d.user_id, u.callsign, d.status, d.sweep_type,
-                   d.issued_ts, d.instruction
-            FROM dispatches d
-            JOIN users u ON u.id = d.user_id
-            WHERE d.segment_id = ?
-              AND d.mission_id = ?
-              AND d.status IN ('pending', 'acked', 'in_progress')
-            ORDER BY d.issued_ts DESC
-            """,
-            (row["id"], mid),
-        ).fetchall()
-
-    result = dict(row)
-    result["remaining_probability"] = round(float(result["poa"]) * (1.0 - float(result["pod"])), 6)
-    result["hazards"] = [dict(h) for h in hazards]
-    result["active_dispatches"] = [dict(d) for d in dispatches]
-    return result
-
-
-# Gets clues, sightings, hazards, footprints, and dropped items that searchers reported.
-# The agent can filter by time or kind when it only wants recent important items.
+# Gets clues, sightings, hazards, and notes that searchers reported.
+# Feeds the routing-agent pre-compute's "nearest clue" fact.
 def get_findings(
     since_ts: int | None = None,
     kind: str | None = None,
@@ -329,107 +226,8 @@ def get_findings(
     return [dict(row) for row in rows]
 
 
-# Summarizes the ground inside one segment.
-# It counts things like steep cells, trails, searched cells, and danger flags.
-def get_terrain_summary(segment_id: int, mission_id: int | None = None) -> dict[str, Any]:
-    """Return terrain and coverage aggregate for one segment."""
-    mid = _resolve_mission_id(mission_id)
-    segment = get_segment(segment_id, mid)
-    with session() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS total_hexes,
-                   AVG(slope_deg) AS avg_slope_deg,
-                   MAX(slope_deg) AS max_slope_deg,
-                   SUM(has_trail) AS trail_hexes,
-                   SUM(has_road) AS road_hexes,
-                   SUM(is_water) AS water_hexes,
-                   SUM(is_building) AS building_hexes,
-                   SUM(flag_danger) AS danger_hexes,
-                   SUM(flag_impassable) AS impassable_hexes,
-                   SUM(flag_clue) AS clue_hexes,
-                   SUM(flag_searched) AS searched_hexes,
-                   SUM(CASE WHEN is_water = 0 AND is_building = 0
-                              AND flag_impassable = 0 THEN 1 ELSE 0 END)
-                     AS searchable_hexes
-            FROM hex_cells
-            WHERE mission_id = ? AND segment_id = ?
-            """,
-            (mid, segment_id),
-        ).fetchone()
-    summary = dict(row) if row else {}
-    summary.update({
-        "mission_id": mid,
-        "segment_id": segment["id"],
-        "segment_name": segment["name"],
-        "segment_status": segment["status"],
-        "poa": segment["poa"],
-        "pod": segment["pod"],
-        "dominant_cover": segment["dominant_cover"],
-        "trail_length_m": segment["trail_length_m"],
-    })
-    return summary
-
-
-# Finds the best places to search next.
-# It ranks segments by how much useful probability is still left there.
-def get_uncovered_areas(
-    min_poa: float = 0.0,
-    mission_id: int | None = None,
-    limit: int = 8,
-) -> list[dict[str, Any]]:
-    """Rank segments by remaining probability mass: POA * (1 - POD)."""
-    mid = _resolve_mission_id(mission_id)
-    with session() as conn:
-        rows = conn.execute(
-            """
-            SELECT s.id, s.name, s.status, s.poa, s.pod, s.pos, s.sweep_type,
-                   s.assigned_user_id, u.callsign AS assigned_callsign,
-                   s.avg_slope_deg, s.dominant_cover, s.trail_length_m,
-                   (s.poa * (1.0 - s.pod)) AS remaining_probability,
-                   COALESCE((
-                     SELECT COUNT(*) FROM hazards h
-                     WHERE h.mission_id = s.mission_id
-                       AND ST_Intersects(h.geom, s.geom)
-                   ), 0) AS hazard_count
-            FROM segments s
-            LEFT JOIN users u ON u.id = s.assigned_user_id
-            WHERE s.mission_id = ?
-              AND s.poa >= ?
-              AND s.status != 'cleared'
-            ORDER BY remaining_probability DESC, s.poa DESC
-            LIMIT ?
-            """,
-            (mid, min_poa, limit),
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-# Makes a simple route hint between two GPS points.
-# If trails exist, it bends the route through the nearest trail points.
-def query_route(
-    from_lat: float,
-    from_lon: float,
-    to_lat: float,
-    to_lon: float,
-    mission_id: int | None = None,
-) -> dict[str, Any]:
-    """Return snap-to-nearest-trail waypoints between two points."""
-    mid = _resolve_mission_id(mission_id)
-    snap_start = snap_point_to_nearest_trail(mid, from_lat, from_lon)
-    snap_target = snap_point_to_nearest_trail(mid, to_lat, to_lon)
-    waypoints = [{"lat": from_lat, "lon": from_lon}]
-    snapped = False
-    if snap_start is not None and snap_target is not None:
-        waypoints.append({"lat": snap_start[0], "lon": snap_start[1]})
-        waypoints.append({"lat": snap_target[0], "lon": snap_target[1]})
-        snapped = True
-    waypoints.append({"lat": to_lat, "lon": to_lon})
-    return {"mission_id": mid, "waypoints": waypoints, "snapped": snapped}
-
-
 # Collects the newest things that happened in a mission.
-# The worker uses this to decide whether the agent needs to wake up.
+# The routing worker uses this to decide whether to invoke the dispatcher.
 def recent_events(
     mission_id: int | None = None,
     since_ts: int | None = None,
@@ -484,12 +282,3 @@ def recent_events(
         events.extend(dict(row) for row in rows)
     events.sort(key=lambda e: e.get("ts") or 0, reverse=True)
     return events[:limit]
-
-
-# Builds the main mission story the agent reads first.
-# This is a convenience tool so OpenClaw can ask for the brief again.
-def get_mission_brief(mission_id: int | None = None) -> str:
-    """Return the deterministic mission brief that the worker gives OpenClaw."""
-    from agent.brief import compose_brief
-
-    return compose_brief(mission_id=mission_id)

@@ -200,9 +200,8 @@ def main() -> int:
     from fastapi.testclient import TestClient
 
     from api.main import app
-    from agent.brief import compose_brief
     from agent.skills.read import get_findings, get_searcher
-    from agent.skills.write import dispatch_searcher, reassign_searcher
+    from agent.skills.write import dispatch_searcher
 
     sim_start = int(time.time()) - 3600
     print(f"DB_PATH={DB_PATH}", flush=True)
@@ -351,9 +350,17 @@ def main() -> int:
                 finding_id = finding.json()["finding_id"]
 
             if offset == REASSIGN_AT_SECONDS:
-                charlie_reassign = reassign_searcher(
+                # reassign_searcher was deprecated alongside the commander-grade tools.
+                # Replicate the flow with the surviving primitives: complete the old
+                # dispatch via the HTTP endpoint, then issue a fresh dispatch_searcher.
+                client.post(
+                    f"/field/dispatch/{dispatches['CHARLIE']['dispatch_id']}/complete",
+                    headers={"X-Bearer-Token": people["CHARLIE"]["token"]},
+                    json={"notes": "Recalled before completion to follow up on ALPHA's clue."},
+                )
+                charlie_reassign = dispatch_searcher(
                     user_id=people["CHARLIE"]["user_id"],
-                    new_segment_id=chosen["charlie_target"]["id"],
+                    segment_id=chosen["charlie_target"]["id"],
                     sweep_type="hasty",
                     instruction=(
                         f"Leave your current outer segment and move northeast to "
@@ -418,22 +425,18 @@ def main() -> int:
                 (mission_id,),
             ).fetchone()
 
+        # After the reassign rewire (complete + fresh dispatch), the old dispatch
+        # ends as 'completed' rather than 'superseded'. The downstream effect
+        # (CHARLIE is now on the new target) is identical.
         check(
-            "old CHARLIE dispatch superseded",
-            old["status"] == "superseded" and old["superseded_by"] == charlie_reassign["dispatch_id"],
-            f"old_status={old['status']} superseded_by={old['superseded_by']}",
+            "old CHARLIE dispatch closed",
+            old["status"] == "completed",
+            f"old_status={old['status']}",
         )
         check(
             "movement searched hexes",
             searched["n"] > 0,
             f"searched_hexes={searched['n']}",
-        )
-
-        final_brief = compose_brief(mission_id)
-        check(
-            "final brief mentions clue",
-            "footprint" in final_brief and "CHARLIE" in final_brief,
-            f"brief_chars={len(final_brief)}",
         )
 
         print("SUMMARY", flush=True)
