@@ -9,12 +9,12 @@ Hackathon project: an autonomous AI mission commander for land search-and-rescue
 - **Phones (iPhones)** — each searcher carries one running the Expo/Swift app.
 
 ## Network reality
-**All devices share a phone-hotspot SSID during demo and dev.** This is the only way the laptops and phones can reach the DGX — there is no public ingress, no VPN, no internet-routable address for the DGX. Consequences:
+**Laptops and the DGX share a phone-hotspot SSID during demo and dev.** Phones reach the DGX via an **ngrok tunnel** fronting the FastAPI server — they do not need to be on the hotspot. Consequences:
 
-- **GitHub Actions / cloud CI cannot reach the DGX.** Any deploy automation must run from a laptop already on the hotspot (or be a `git pull` initiated on the DGX itself).
+- **GitHub Actions / cloud CI cannot reach the DGX directly.** Any deploy automation must run from a laptop already on the hotspot (or be a `git pull` initiated on the DGX itself).
 - Deploy = `ssh dgx 'cd geo-beacon && git pull && ./scripts/respawn-workers.sh'` from a laptop on the hotspot.
-- The app talks to the DGX by LAN IP, not domain name. App config needs DGX IP at build time (or via env).
-- If the hotspot reboots, DGX IP may change. Don't bake an IP into anything; read from env.
+- The app talks to the DGX through the ngrok public URL, not a LAN IP or domain name. App config needs the ngrok URL (via env / constants file) so it can be swapped when the tunnel restarts.
+- ngrok URLs change every time the tunnel restarts. Don't bake a URL into anything; read from env.
 - Cellular coverage in real SAR terrain is often zero. For the hackathon demo we pretend it works; for "real" deployment this app would need offline buffering on the phone (out of scope).
 
 ## Migrations
