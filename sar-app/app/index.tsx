@@ -2,6 +2,7 @@ import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -46,14 +47,18 @@ export default function MissionSelector() {
   }, []);
 
   async function onDemoMode() {
+    console.log('[demo] onDemoMode tapped, serverUrl=', JSON.stringify(serverUrl));
     if (!serverUrl.trim()) {
+      console.log('[demo] empty serverUrl, bailing');
       setErrors({ serverUrl: 'Required' });
       return;
     }
     setBusy(true);
     try {
       await setString(Keys.ServerUrl, serverUrl.trim());
+      console.log('[demo] calling getDemoCredentials');
       const creds = await getDemoCredentials(serverUrl.trim());
+      console.log('[demo] got creds', JSON.stringify(creds));
       const mission: CurrentMission = {
         mission_id: creds.mission_id,
         bearer_token: creds.bearer_token,
@@ -63,8 +68,12 @@ export default function MissionSelector() {
         server_url: serverUrl.trim(),
       };
       await setJSON(Keys.CurrentMission, mission);
+      console.log('[demo] navigating to /mission');
       router.replace('/mission');
     } catch (e) {
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      console.log('[demo] ERROR', msg);
+      Alert.alert('Demo mode failed', msg);
       if (e instanceof ServerError && e.status === 404) {
         setErrors({ submit: 'No demo snapshot loaded. POST /debug/restore first.' });
       } else if (e instanceof ServerError) {
