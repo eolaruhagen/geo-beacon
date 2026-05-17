@@ -60,6 +60,12 @@ async def field_ping(
     if mission_id is None:
         raise HTTPException(status_code=409, detail="No active mission for this user")
 
+    # Observer users (demo mode) are passive viewers — their phone shouldn't
+    # interfere with simulated movement. Silently no-op so the phone gets a
+    # 200 and doesn't loop on errors.
+    if user.get("is_observer"):
+        return PingResponse(ping_id=0)
+
     ts = body.ts if body.ts is not None else int(time.time())
     ping_id = db_pings.insert_ping(
         user_id=user["id"],

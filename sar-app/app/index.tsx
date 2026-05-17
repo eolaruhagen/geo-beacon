@@ -12,7 +12,7 @@ import {
   View,
 } from 'react-native';
 
-import { joinMission, NetworkError, ServerError } from './lib/api';
+import { getDemoCredentials, joinMission, NetworkError, ServerError } from './lib/api';
 import { Keys, getString, setString, setJSON, CurrentMission } from './lib/storage';
 
 type FieldErrors = {
@@ -44,6 +44,40 @@ export default function MissionSelector() {
       if (j) setJoinCode(j);
     })();
   }, []);
+
+  async function onDemoMode() {
+    if (!serverUrl.trim()) {
+      setErrors({ serverUrl: 'Required' });
+      return;
+    }
+    setBusy(true);
+    try {
+      await setString(Keys.ServerUrl, serverUrl.trim());
+      const creds = await getDemoCredentials(serverUrl.trim());
+      const mission: CurrentMission = {
+        mission_id: creds.mission_id,
+        bearer_token: creds.bearer_token,
+        user_id: creds.user_id,
+        callsign: creds.callsign,
+        mission_name: `Demo #${creds.mission_id}`,
+        server_url: serverUrl.trim(),
+      };
+      await setJSON(Keys.CurrentMission, mission);
+      router.replace('/mission');
+    } catch (e) {
+      if (e instanceof ServerError && e.status === 404) {
+        setErrors({ submit: 'No demo snapshot loaded. POST /debug/restore first.' });
+      } else if (e instanceof ServerError) {
+        setErrors({ submit: `Server error: ${e.detail}` });
+      } else if (e instanceof NetworkError) {
+        setErrors({ submit: "Could not reach server. Check the URL." });
+      } else {
+        setErrors({ submit: 'Unexpected error' });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function onJoin() {
     const nextErrors: FieldErrors = {};
@@ -160,6 +194,22 @@ export default function MissionSelector() {
             <Text style={s.buttonText}>Join mission</Text>
           )}
         </Pressable>
+
+        {/* Demo mode: skips join entirely. Hits /debug/demo-credentials to
+            grab the observer user's bearer token (after /debug/restore has
+            been called server-side), stashes it as if it were a fresh join,
+            and jumps straight to the mission. Phone's pings get muted
+            server-side; the sim writes them instead. */}
+        <Pressable
+          onPress={onDemoMode}
+          disabled={busy}
+          style={({ pressed }) => [
+            s.demoButton,
+            (busy || pressed) && s.buttonPressed,
+          ]}
+        >
+          <Text style={s.demoButtonText}>Demo mode (observer)</Text>
+        </Pressable>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -216,4 +266,14 @@ const s = StyleSheet.create({
   buttonPressed: { opacity: 0.7 },
   buttonInner: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  demoButton: {
+    marginTop: 10,
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(60,60,67,0.25)',
+    backgroundColor: '#fff',
+  },
+  demoButtonText: { color: '#3c3c43', fontSize: 14, fontWeight: '500' },
 });

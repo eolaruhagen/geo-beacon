@@ -172,3 +172,166 @@ async def debug_snapshot(
         caller["id"], dest_path, size_bytes,
     )
     return SnapshotResponse(path=str(dest_path), bytes=size_bytes, ts=ts)
+
+
+class RestoreResponse(BaseModel):
+    snapshot_path: str
+    mission_id: int
+    user_id: int
+    callsign: Optional[str]
+    bearer_token: str
+
+
+@router.post("/restore", response_model=RestoreResponse, status_code=201)
+async def debug_restore() -> RestoreResponse:
+    """Restore the OLDEST snapshot file as the live DB, keep one searcher.
+
+    Demo flow:
+      1. Find the oldest snapshot in MISSION_SNAPSHOT_DIR.
+      2. sqlite3.backup() it over the live DB.
+      3. Apply any pending migrations (the snapshot may predate columns
+         the running code requires — e.g. users.is_observer in 006).
+      4. Pick the lowest-id searcher to keep; re-attribute every other
+         user's pings/findings/dispatches/coverage/assignments to them.
+      5. Delete the other users.
+      6. Mark the kept user is_observer=1 and reset their status to
+         standby. Cancel any in-flight dispatches and unassign segments
+         so the agent gets a clean slate to dispatch from.
+
+    No bearer-token auth — the snapshot rewrites the users table, so the
+    caller's token would be invalidated mid-request anyway. Demo-only.
+    """
+    snaps = sorted(SNAPSHOT_DIR.glob("mission-*.db"), key=lambda p: p.stat().st_mtime)
+    if not snaps:
+        raise HTTPException(status_code=404, detail=f"No snapshots in {SNAPSHOT_DIR}")
+    oldest = snaps[0]
+
+    target_path = db_path()
+    src = sqlite3.connect(str(oldest), timeout=30)
+    try:
+        dst = sqlite3.connect(target_path, timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    # Make sure the restored DB has every migration applied — including
+    # any added since the snapshot was taken.
+    from scripts.apply_migrations import apply, DEFAULT_MIGRATIONS_DIR
+    apply(target_path, DEFAULT_MIGRATIONS_DIR)
+
+    with session() as conn:
+        conn.execute("BEGIN")
+        try:
+            kept = conn.execute(
+                """
+                SELECT id, callsign, bearer_token, current_mission_id
+                FROM users WHERE role = 'searcher'
+                ORDER BY id ASC LIMIT 1
+                """
+            ).fetchone()
+            if kept is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Restored snapshot has no searcher users",
+                )
+            kept_id = kept["id"]
+            mission_id = kept["current_mission_id"]
+            if mission_id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Kept user {kept_id} has no current_mission_id",
+                )
+
+            # Re-attribute data from all other users to the kept user so the
+            # restored map keeps its lived-in look without any orphan FKs.
+            conn.execute("UPDATE pings        SET user_id = ?           WHERE user_id != ?",          (kept_id, kept_id))
+            conn.execute("UPDATE findings     SET reporter_user_id = ?  WHERE reporter_user_id != ?", (kept_id, kept_id))
+            conn.execute("UPDATE dispatches   SET user_id = ?           WHERE user_id != ?",          (kept_id, kept_id))
+            conn.execute(
+                "UPDATE hex_cells SET searched_by_user_id = ? "
+                "WHERE searched_by_user_id IS NOT NULL AND searched_by_user_id != ?",
+                (kept_id, kept_id),
+            )
+            conn.execute(
+                "UPDATE segments SET assigned_user_id = ? "
+                "WHERE assigned_user_id IS NOT NULL AND assigned_user_id != ?",
+                (kept_id, kept_id),
+            )
+
+            # Drop everyone else. We allow this because we just re-attributed
+            # every FK that pointed at them.
+            conn.execute("DELETE FROM users WHERE id != ?", (kept_id,))
+
+            # Clean demo start: cancel any in-flight dispatches and unassign
+            # only the segments they touched (preserve swept/cleared).
+            conn.execute(
+                "UPDATE dispatches SET status = 'cancelled' "
+                "WHERE status IN ('pending', 'acked', 'in_progress')"
+            )
+            conn.execute(
+                "UPDATE segments SET assigned_user_id = NULL, status = 'unassigned' "
+                "WHERE status IN ('assigned', 'in_progress')"
+            )
+
+            # Mark kept user observer + reset status.
+            conn.execute(
+                "UPDATE users SET is_observer = 1, status = 'standby' WHERE id = ?",
+                (kept_id,),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    logger.info(
+        "restored snapshot %s; kept user_id=%s in mission %s",
+        oldest.name, kept_id, mission_id,
+    )
+    return RestoreResponse(
+        snapshot_path=str(oldest),
+        mission_id=mission_id,
+        user_id=kept_id,
+        callsign=kept["callsign"],
+        bearer_token=kept["bearer_token"],
+    )
+
+
+class DemoCredentials(BaseModel):
+    mission_id: int
+    user_id: int
+    callsign: Optional[str]
+    bearer_token: str
+
+
+@router.get("/demo-credentials", response_model=DemoCredentials)
+async def debug_demo_credentials() -> DemoCredentials:
+    """Return the observer user's credentials so the phone can join as them
+    without going through the regular /missions/join flow (which would create
+    a fresh user row). No auth — purely a demo convenience endpoint.
+    """
+    with session() as conn:
+        row = conn.execute(
+            """
+            SELECT id, callsign, bearer_token, current_mission_id
+            FROM users WHERE is_observer = 1 LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No observer user — run POST /debug/restore first",
+            )
+        if row["current_mission_id"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Observer user has no current_mission_id",
+            )
+        return DemoCredentials(
+            mission_id=row["current_mission_id"],
+            user_id=row["id"],
+            callsign=row["callsign"],
+            bearer_token=row["bearer_token"],
+        )

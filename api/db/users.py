@@ -72,7 +72,7 @@ def get_user_by_token(token: str) -> dict | None:
     with session() as conn:
         row = conn.execute(
             "SELECT id, display_name, callsign, phone, role, status, bearer_token, "
-            "current_mission_id, created_ts "
+            "current_mission_id, is_observer, created_ts "
             "FROM users WHERE bearer_token = ?",
             (token,),
         ).fetchone()
@@ -83,7 +83,7 @@ def get_user(user_id: int) -> dict | None:
     with session() as conn:
         row = conn.execute(
             "SELECT id, display_name, callsign, phone, role, status, bearer_token, "
-            "current_mission_id, created_ts "
+            "current_mission_id, is_observer, created_ts "
             "FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()

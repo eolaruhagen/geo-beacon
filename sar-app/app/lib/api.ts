@@ -327,3 +327,18 @@ export function postSnapshot(
 ): Promise<SnapshotResponse> {
   return authedPost<SnapshotResponse>(serverUrl, bearerToken, '/debug/snapshot', {});
 }
+
+// ─── /debug/demo-credentials ─────────────────────────────────────────────
+// Demo helper: returns the observer user's credentials so the phone can
+// "join" as them without creating a fresh user row. No auth required —
+// the snapshot restore wipes existing tokens anyway.
+export type DemoCredentials = {
+  mission_id: number;
+  user_id: number;
+  callsign: string | null;
+  bearer_token: string;
+};
+
+export async function getDemoCredentials(serverUrl: string): Promise<DemoCredentials> {
+  return request<DemoCredentials>(serverUrl, '/debug/demo-credentials', { method: 'GET' });
+}
